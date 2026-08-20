@@ -2,10 +2,12 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { ArrowUpRight, Bot, Check, CheckCircle2, ChevronRight, Clipboard, Copy, Download, Filter, Mail, Megaphone, Plus, RefreshCw, Sparkles, Target, Users, X } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { fetchDashboardStats, fetchCampaigns, DashboardStats, CampaignRow } from "@/lib/data";
 import { Theme, useTheme } from "@/components/theme-provider";
+import LandingPagesBuilder from "@/components/landing-pages-builder";
 
 type ContactRow = {
     id: string;
@@ -131,6 +133,7 @@ function formatDate(value: string) { return new Date(value).toLocaleDateString("
 
 export default function MarketingPage() {
     const { theme: t } = useTheme();
+    const searchParams = useSearchParams();
     const [contacts, setContacts] = useState<ContactRow[]>([]);
     const [campaigns, setCampaigns] = useState<CampaignRow[]>([]);
     const [queue, setQueue] = useState<QueueRow[]>([]);
@@ -308,6 +311,8 @@ export default function MarketingPage() {
         queue.length > 0 ? { icon: Mail, color: t.accent, title: `${queue.length} follow-up${queue.length === 1 ? "" : "s"} queued`, body: "Your existing Resend queue will handle delivery and tracking." } : { icon: Mail, color: t.textMuted, title: "No follow-ups queued", body: "Create a campaign from one of the playbooks below." },
         { icon: Sparkles, color: t.amber, title: "Personalize the next campaign", body: "Use the existing AI Personalize Selected flow before launch." },
     ];
+
+    if (searchParams.get("tab") === "landing-pages") return <LandingPagesBuilder />;
 
     return <div style={{ display: "flex", flexDirection: "column", gap: 28, fontFamily: t.font }}>
         <style>{css}</style>

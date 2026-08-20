@@ -57,7 +57,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Enter your name and a valid work email." }, { status: 400 });
     }
 
+    const pageSlug = clean(body.page_slug, 100).toLowerCase().replace(/[^a-z0-9-]/g, "");
     const tags = attributionTags(body);
+    if (pageSlug) tags.push(`page:${pageSlug}`);
     const { data: existing, error: lookupError } = await serverSupabase
       .from("contacts")
       .select("id,tags,status")
@@ -94,6 +96,37 @@ export async function POST(request: Request) {
         if (retryError) throw retryError;
       } else {
         throw mutationError;
+        }
+    }
+
+    // Keep a page-level conversion record in addition to the existing contacts
+    // table. This is best-effort so an older database still captures the lead.
+    if (pageSlug) {
+      try {
+        const { data: landingPage } = await serverSupabase
+          .from("landing_pages")
+          .select("id")
+          .eq("slug", pageSlug)
+          .eq("status", "published")
+          .maybeSingle();
+        if (landingPage?.id) {
+          await serverSupabase.from("landing_page_submissions").insert({
+            page_id: landingPage.id,
+            email,
+            name,
+            company_name: clean(body.company_name, 160) || null,
+            job_title: clean(body.job_title, 120) || null,
+            source: "landing-page",
+            metadata: {
+              utm_source: clean(body.utm_source, 80),
+              utm_medium: clean(body.utm_medium, 80),
+              utm_campaign: clean(body.utm_campaign, 80),
+              utm_content: clean(body.utm_content, 80),
+            },
+          });
+        }
+      } catch (submissionError) {
+        console.error("Landing-page submission log failed", submissionError);
       }
     }
 

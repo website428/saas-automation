@@ -12,6 +12,7 @@ import { useTheme } from "@/components/theme-provider";
 const navItems = [
     { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
     { label: "Marketing", href: "/dashboard/marketing", icon: Megaphone },
+    { label: "Landing Pages", href: "/dashboard/marketing?tab=landing-pages", icon: Globe },
     { label: "Automation", href: "/dashboard/automation", icon: Zap },
     { label: "Campaigns", href: "/dashboard/campaigns", icon: Send },
     { label: "Contacts", href: "/dashboard/contacts", icon: Users },

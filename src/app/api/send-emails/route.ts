@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { Resend } from 'resend';
 import { supabase } from '@/lib/supabase';
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-
 type PersonalizableContact = {
     email: string;
     name: string | null;
@@ -106,6 +104,10 @@ export async function POST(req: NextRequest) {
         if (!process.env.RESEND_API_KEY) {
             return NextResponse.json({ error: 'RESEND_API_KEY is not configured' }, { status: 500 });
         }
+        // Initialise Resend only when a request is actually handled. Vercel
+        // imports route modules during build, when runtime secrets may not be
+        // available yet.
+        const resend = new Resend(process.env.RESEND_API_KEY);
         const { campaignId, force } = await req.json();
         // `force` only skips the scheduled_at time filter — it NEVER bypasses daily limits.
         // Daily limit is a hard wall enforced at every step.
