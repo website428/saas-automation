@@ -1,9 +1,22 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const missingSupabaseConfig = () => {
+  throw new Error(
+    'Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in the deployment environment.',
+  );
+};
+
+// Do not throw while Next.js is importing route modules during build. The proxy
+// still fails immediately and clearly if a request reaches the app without the
+// required runtime variables.
+export const supabase = supabaseUrl && supabaseAnonKey
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : new Proxy({} as ReturnType<typeof createClient>, {
+      get: missingSupabaseConfig,
+    });
 
 // Types for our database tables
 export interface Domain {
