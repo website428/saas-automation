@@ -1,0 +1,19 @@
+# dependencies
+/node_modules
+
+# Next.js build output
+/.next
+/out
+
+# local credentials and deployment secrets
+.env*
+!.env.example
+
+# local contact exports and generated artifacts
+/26-2.csv
+/outputs/
+
+# logs and local tooling
+*.log
+*.tsbuildinfo
+.vercel
