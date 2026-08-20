@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { ArrowUpRight, Bot, Check, CheckCircle2, ChevronRight, Clipboard, Copy, Download, Filter, Mail, Megaphone, Plus, RefreshCw, Sparkles, Target, Users, X } from "lucide-react";
@@ -131,7 +131,7 @@ function TemplateModal({ open, form, setForm, onClose, onSubmit, t }: { open: bo
 
 function formatDate(value: string) { return new Date(value).toLocaleDateString("en-IN", { day: "2-digit", month: "short" }); }
 
-export default function MarketingPage() {
+function MarketingPageContent() {
     const { theme: t } = useTheme();
     const searchParams = useSearchParams();
     const [contacts, setContacts] = useState<ContactRow[]>([]);
@@ -360,4 +360,8 @@ export default function MarketingPage() {
         <div className="marketing-two"><TemplateStudio templates={templates} t={t} copied={templateCopied} onCopy={template => copyTemplate(template)} onAdd={() => setShowTemplate(true)} /><EventSnippetGenerator campaigns={campaigns} eventType={eventType} setEventType={setEventType} campaignId={eventCampaignId} setCampaignId={setEventCampaignId} snippet={eventSnippet} copied={eventSnippetCopied} onCopy={copyEventSnippet} t={t} /></div>
         <TemplateModal open={showTemplate} form={templateForm} setForm={setTemplateForm} onClose={() => setShowTemplate(false)} onSubmit={addTemplate} t={t} />
     </div>;
+}
+
+export default function MarketingPage() {
+    return <Suspense fallback={<div style={{ padding: 24, fontFamily: "Arial, sans-serif" }}>Loading marketing workspace…</div>}><MarketingPageContent /></Suspense>;
 }
