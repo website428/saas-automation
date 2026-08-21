@@ -109,18 +109,12 @@ export default function CampaignsPage() {
 
             if (!data) { setLoading(false); return; }
 
-            const enriched = await Promise.all(data.map(async (c: any) => {
-                let derivedStatus = c.status;
-                if (c.status === 'active' && c.total_contacts > 0) {
-                    const { count: queuedCount } = await supabase
-                        .from('email_queue').select('id', { count: 'exact', head: true })
-                        .eq('campaign_id', c.id).eq('status', 'queued');
-                    if ((queuedCount ?? 0) === 0 && c.sent_count >= c.total_contacts) {
-                        derivedStatus = 'completed';
-                        supabase.from('campaigns').update({ status: 'completed' }).eq('id', c.id).then(() => { });
-                    }
-                }
-                return { ...c, domain_name: c.domains?.domain_name || '', status: derivedStatus };
+            // Sending workers own campaign completion. The list must not infer a
+            // completed status because lifecycle campaigns intentionally remain
+            // active while waiting for future leads.
+            const enriched = data.map((c: any) => ({
+                ...c,
+                domain_name: c.domains?.domain_name || '',
             }));
 
             setCampaigns(enriched);

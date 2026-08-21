@@ -2,6 +2,12 @@
 
 import { FormEvent, useState } from "react";
 import { LandingPage, LandingSection, asItems, asText } from "@/lib/landing-pages";
+import MetaPixel from "@/components/meta-pixel";
+
+function trackMetaEvent(eventName: string) {
+    const win = window as Window & { fbq?: (...args: unknown[]) => void };
+    win.fbq?.("track", eventName);
+}
 
 function buttonStyle(primary = true): React.CSSProperties {
     return { display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "13px 18px", borderRadius: 8, border: primary ? "1px solid #102536" : "1px solid #c8d3d0", background: primary ? "#102536" : "transparent", color: primary ? "#fff" : "#102536", fontWeight: 700, fontSize: 13, textDecoration: "none", cursor: "pointer" };
@@ -32,6 +38,7 @@ function LeadForm({ content, onLead }: { content: Record<string, unknown>; onLea
         const response = await fetch("/api/leads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...form, page_slug: params.get("page") || window.location.pathname.replace(/^\/p\//, "") || "landing-page", utm_source: params.get("utm_source") || "", utm_medium: params.get("utm_medium") || "", utm_campaign: params.get("utm_campaign") || "" }) });
         const body = await response.json();
         setMessage(response.ok ? asText(content.success_message, "Thanks — we will be in touch shortly.") : body.error || "Please try again.");
+        if (response.ok) trackMetaEvent("Lead");
         if (response.ok) setForm({ name: "", email: "", company_name: "", job_title: "", website: "" });
         setSaving(false);
     }
@@ -39,5 +46,5 @@ function LeadForm({ content, onLead }: { content: Record<string, unknown>; onLea
 }
 
 export default function PublicLandingPage({ page }: { page: LandingPage }) {
-    return <main style={{ minHeight: "100vh", background: "#f6f8f4", color: "#102536", fontFamily: "Arial, sans-serif" }}><div style={{ maxWidth: 1180, margin: "0 auto", padding: "0 28px" }}><header style={{ height: 74, display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #d7e0dd" }}><strong style={{ fontSize: 18, letterSpacing: "-.03em" }}>{page.name}</strong><a href="#lead-form" style={buttonStyle(false)}>Get started ↗</a></header>{page.sections.sort((a, b) => a.sort_order - b.sort_order).map((section, index) => <Section key={section.id || index} section={section} />)}<footer style={{ padding: "35px 0 45px", color: "#8a9aa2", fontSize: 11, borderTop: "1px solid #d7e0dd" }}>© {new Date().getFullYear()} {page.name}</footer></div></main>;
+    return <main style={{ minHeight: "100vh", background: "#f6f8f4", color: "#102536", fontFamily: "Arial, sans-serif" }}><MetaPixel /><div style={{ maxWidth: 1180, margin: "0 auto", padding: "0 28px" }}><header style={{ height: 74, display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid #d7e0dd" }}><strong style={{ fontSize: 18, letterSpacing: "-.03em" }}>{page.name}</strong><a href="#lead-form" style={buttonStyle(false)}>Get started ↗</a></header>{page.sections.slice().sort((a, b) => a.sort_order - b.sort_order).map((section, index) => <Section key={section.id || index} section={section} />)}<footer style={{ padding: "35px 0 45px", color: "#8a9aa2", fontSize: 11, borderTop: "1px solid #d7e0dd" }}>© {new Date().getFullYear()} {page.name}</footer></div></main>;
 }

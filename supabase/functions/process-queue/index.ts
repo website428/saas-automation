@@ -400,7 +400,13 @@ Deno.serve(async (req: Request) => {
                 .from('email_queue').select('id', { count: 'exact', head: true })
                 .eq('campaign_id', c.id).eq('status', 'queued');
 
-            if ((remaining ?? 0) === 0) {
+            const { count: activeAutomationRules } = await supabase
+                .from('marketing_automation_rules')
+                .select('id', { count: 'exact', head: true })
+                .eq('campaign_id', c.id)
+                .eq('enabled', true);
+
+            if ((remaining ?? 0) === 0 && (activeAutomationRules ?? 0) === 0) {
                 const { count: sentCount } = await supabase
                     .from('email_queue').select('id', { count: 'exact', head: true })
                     .eq('campaign_id', c.id).eq('status', 'sent');

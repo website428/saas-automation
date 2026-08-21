@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Resend } from 'resend';
-import { supabase } from '@/lib/supabase';
+import { serverSupabase } from '@/lib/server-supabase';
+
+export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 type PersonalizableContact = {
     email: string;
@@ -90,7 +93,8 @@ async function isValidEmail(email: string): Promise<boolean> {
 
     try {
         const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=MX`, {
-            headers: { 'accept': 'application/dns-json' }
+            headers: { 'accept': 'application/dns-json' },
+            signal: AbortSignal.timeout(5000),
         });
         const data = await res.json();
         return data.Status === 0 && Array.isArray(data.Answer) && data.Answer.length > 0;
@@ -114,7 +118,7 @@ export async function POST(req: NextRequest) {
         if (!campaignId) return NextResponse.json({ error: 'campaignId required' }, { status: 400 });
 
         // Fetch campaign + domain
-        const { data: campaign, error: cErr } = await supabase
+        const { data: campaign, error: cErr } = await serverSupabase
             .from('campaigns')
             .select('*, domains(id, domain_name, from_email, sender_name, daily_limit, emails_sent_today, send_hour_start, send_hour_end)')
             .eq('id', campaignId)
@@ -124,7 +128,8 @@ export async function POST(req: NextRequest) {
         const domain = campaign.domains as any;
         if (!domain) return NextResponse.json({ error: 'Domain not found' }, { status: 404 });
 
-        // ALWAYS Check Office Hours Window (in IST) - even on manual sends!
+        // Automated sends respect the configured IST window. A deliberate manual
+        // force-send bypasses timing restrictions; quota limits remain hard.
         const s = domain.send_hour_start ?? 9;
         const e = domain.send_hour_end ?? 20;
         const currentISTHour = new Date(Date.now() + 5.5 * 3600000).getUTCHours();
@@ -133,7 +138,7 @@ export async function POST(req: NextRequest) {
             ? (currentISTHour >= s && currentISTHour < e)
             : (currentISTHour >= s || currentISTHour < e); // Overnight shift
             
-        if (!isOfficeHours) {
+        if (!isOfficeHours && !force) {
             return NextResponse.json({ error: `Outside office hours (Window: ${s}:00 to ${e}:00 IST)`, sent: 0 }, { status: 429 });
         }
 
@@ -153,7 +158,7 @@ export async function POST(req: NextRequest) {
         const nowIso = new Date().toISOString();
 
         // Build the query
-        let query = supabase
+        let query = serverSupabase
             .from('email_queue')
             .select('*, contacts(email, name, status, company_name, job_title, website, personalization, custom_subject, custom_body)')
             .eq('campaign_id', campaignId)
@@ -178,14 +183,15 @@ export async function POST(req: NextRequest) {
         let sent = 0;
         const errors: string[] = [];
 
-        for (const item of queued) {
+        for (let itemIndex = 0; itemIndex < queued.length; itemIndex++) {
+            const item = queued[itemIndex];
             const contact = item.contacts as PersonalizableContact | null;
             if (!contact) continue;
 
             // A contact may opt out or bounce after the queue was created. Re-check at
             // send time so stale queue rows can never override suppression state.
             if (contact.status === 'unsubscribed' || contact.status === 'bounced') {
-                await supabase.from('email_queue').update({
+                await serverSupabase.from('email_queue').update({
                     status: 'cancelled',
                     error_message: `Suppressed contact: ${contact.status}`,
                 }).eq('id', item.id);
@@ -195,7 +201,7 @@ export async function POST(req: NextRequest) {
             // ── RE-FETCH LIVE COUNTER before each send (prevents race conditions
             //    when multiple cron calls run concurrently for different campaigns
             //    that share the same domain) ──
-            const { data: freshDomain } = await supabase
+            const { data: freshDomain } = await serverSupabase
                 .from('domains')
                 .select('emails_sent_today, daily_limit')
                 .eq('id', domain.id)
@@ -207,7 +213,7 @@ export async function POST(req: NextRequest) {
                 break;
             }
 
-            const { data: claimed } = await supabase.from('email_queue')
+            const { data: claimed } = await serverSupabase.from('email_queue')
                 .update({ status: 'sending' })
                 .eq('id', item.id)
                 .eq('status', 'queued')
@@ -259,24 +265,24 @@ export async function POST(req: NextRequest) {
                 // ── CHECK FAKE MAIL FIRST ──
                 const validMail = await isValidEmail(contact.email);
                 if (!validMail) {
-                    await supabase.from('email_queue').update({
+                    await serverSupabase.from('email_queue').update({
                         status: 'failed',
                         error_message: 'Fake/Invalid Email (No MX Record)',
                         attempts: item.attempts + 1,
                     }).eq('id', item.id);
-                    await supabase.from('contacts').update({ status: 'bounced' }).eq('id', item.contact_id);
+                    await serverSupabase.from('contacts').update({ status: 'bounced' }).eq('id', item.contact_id);
                     errors.push(`${contact.email}: Fake/Invalid Email`);
                     continue; // Skip without actually bouncing the resend domain
                 }
 
                 const dailyLimit = Math.min(100, Math.max(1, Number(process.env.RESEND_DAILY_SEND_LIMIT) || 100));
                 const monthlyLimit = Math.min(3000, Math.max(1, Number(process.env.RESEND_MONTHLY_SEND_LIMIT) || 3000));
-                const { data: reserved, error: quotaError } = await supabase.rpc('reserve_resend_quota_slot', {
+                const { data: reserved, error: quotaError } = await serverSupabase.rpc('reserve_resend_quota_slot', {
                     max_daily: dailyLimit,
                     max_monthly: monthlyLimit,
                 });
                 if (quotaError) {
-                    await supabase.from('email_queue').update({
+                    await serverSupabase.from('email_queue').update({
                         status: 'queued',
                         error_message: `Quota check failed: ${quotaError.message}`,
                     }).eq('id', item.id);
@@ -284,7 +290,7 @@ export async function POST(req: NextRequest) {
                     break;
                 }
                 if (!reserved) {
-                    await supabase.from('email_queue').update({
+                    await serverSupabase.from('email_queue').update({
                         status: 'queued',
                         error_message: 'Resend free-plan daily or monthly quota reached',
                     }).eq('id', item.id);
@@ -304,7 +310,7 @@ export async function POST(req: NextRequest) {
                 // if a later database update fails.
                 quotaReserved = false;
 
-                await supabase.from('email_queue').update({
+                await serverSupabase.from('email_queue').update({
                     status: 'sent',
                     sent_at: new Date().toISOString(),
                     resend_id: resendData?.id,
@@ -312,39 +318,44 @@ export async function POST(req: NextRequest) {
                 }).eq('id', item.id);
 
                 // Atomic increments — no stale reads
-                await supabase.rpc('increment_domain_sent', { did: domain.id });
-                await supabase.rpc('increment_campaign_sent', { cid: campaignId });
+                await serverSupabase.rpc('increment_domain_sent', { did: domain.id });
+                await serverSupabase.rpc('increment_campaign_sent', { cid: campaignId });
 
                 sent++;
             } catch (err: any) {
-                if (quotaReserved) await supabase.rpc('release_resend_quota_slot');
+                if (quotaReserved) await serverSupabase.rpc('release_resend_quota_slot');
                 errors.push(err.message);
-                await supabase.from('email_queue').update({
+                await serverSupabase.from('email_queue').update({
                     status: 'failed',
                     error_message: err.message,
                     attempts: item.attempts + 1,
                 }).eq('id', item.id);
             }
 
-            // ── HUMAN-LIKE PACING: random delay between sends ──
-            // Fixed 600ms looked like a bot pattern to spam filters.
-            // Random 3–12 second gaps mimic how a human would send emails
-            // and significantly reduce spam scoring from pattern detection.
-            const minDelay = 3000;  // 3 seconds minimum
-            const maxDelay = 12000; // 12 seconds maximum
-            const delay = minDelay + Math.random() * (maxDelay - minDelay);
-            await new Promise(resolve => setTimeout(resolve, delay));
+            // Keep automated batches comfortably inside Vercel's function
+            // duration. A manual force-send needs no artificial delay.
+            if (!force && itemIndex < queued.length - 1) {
+                const delay = 250 + Math.random() * 500;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
         }
 
-        // Auto-complete if no queued emails remain
-        const { count: remaining } = await supabase
+        const { count: remaining } = await serverSupabase
             .from('email_queue')
             .select('id', { count: 'exact', head: true })
             .eq('campaign_id', campaignId)
             .eq('status', 'queued');
 
-        if ((remaining ?? 0) === 0 && sent > 0) {
-            await supabase.from('campaigns').update({
+        // Campaigns used by enabled lifecycle rules must remain active so future
+        // leads can enrol even when the current queue becomes empty.
+        const { count: activeAutomationRules } = await serverSupabase
+            .from('marketing_automation_rules')
+            .select('id', { count: 'exact', head: true })
+            .eq('campaign_id', campaignId)
+            .eq('enabled', true);
+
+        if ((remaining ?? 0) === 0 && sent > 0 && (activeAutomationRules ?? 0) === 0) {
+            await serverSupabase.from('campaigns').update({
                 status: 'completed',
                 completed_at: new Date().toISOString(),
             }).eq('id', campaignId);

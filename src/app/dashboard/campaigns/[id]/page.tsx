@@ -98,6 +98,7 @@ export default function CampaignDetailPage() {
     const [refreshing, setRefreshing] = useState(false);
     const [deleting, setDeleting] = useState(false);
     const [confirmDelete, setConfirmDelete] = useState(false);
+    const [sendNotice, setSendNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
     const autoSendRef = useRef(false);
 
     async function load() {
@@ -129,30 +130,41 @@ export default function CampaignDetailPage() {
 
     async function handleSend() {
         setSending(true);
+        setAutoSending(true);
+        setSendProgress({ sent: 0, total: queued });
+        setSendNotice(null);
         autoSendRef.current = true;
         try {
             // Ensure campaign is active
-            await supabase.from('campaigns').update({ status: 'active' }).eq('id', campaignId);
+            const { error: campaignError } = await supabase.from('campaigns').update({ status: 'active', completed_at: null }).eq('id', campaignId);
+            if (campaignError) throw new Error(campaignError.message);
 
             // Mark all queued as due now
-            await supabase
+            const { error: queueError } = await supabase
                 .from('email_queue')
                 .update({ scheduled_at: new Date().toISOString() })
                 .eq('campaign_id', campaignId)
                 .eq('status', 'queued');
+            if (queueError) throw new Error(queueError.message);
 
-            // Loop through ALL batches (50 at a time) until none remain
+            // Loop through all server-sized batches until none remain.
             let totalSent = 0;
             let batchesLeft = true;
+            const providerErrors: string[] = [];
             while (batchesLeft) {
                 const res = await fetch('/api/send-emails', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ campaignId, force: true }),
                 });
-                const result = await res.json();
-                if (!res.ok) { console.error('Send error:', result); break; }
+                const raw = await res.text();
+                let result: any;
+                try { result = raw ? JSON.parse(raw) : {}; }
+                catch { result = { error: raw || `Server returned HTTP ${res.status}` }; }
+                if (!res.ok) throw new Error(result.error || `Force send failed with HTTP ${res.status}`);
                 totalSent += result.sent || 0;
+                setSendProgress({ sent: totalSent, total: queued });
+                if (Array.isArray(result.errors)) providerErrors.push(...result.errors);
                 console.log(`Batch done: sent ${result.sent}, remaining: ${result.remaining}`);
                 await load();
                 if (!result.remaining || result.remaining === 0 || result.sent === 0) {
@@ -163,12 +175,22 @@ export default function CampaignDetailPage() {
                 }
             }
             console.log(`All done. Total sent: ${totalSent}`);
-        } catch (e) {
+            if (providerErrors.length > 0) {
+                setSendNotice({ kind: 'error', text: providerErrors.join(' | ') });
+            } else if (totalSent > 0) {
+                setSendNotice({ kind: 'success', text: `Force send completed: ${totalSent} email${totalSent === 1 ? '' : 's'} accepted by Resend.` });
+            } else {
+                setSendNotice({ kind: 'error', text: 'No email was sent. Refresh the queue and check the row result for details.' });
+            }
+        } catch (e: any) {
             console.error('Send error:', e);
+            setSendNotice({ kind: 'error', text: e?.message || 'Force send failed.' });
+        } finally {
+            autoSendRef.current = false;
+            setAutoSending(false);
+            setSending(false);
+            await load();
         }
-        autoSendRef.current = false;
-        setSending(false);
-        await load();
     }
 
     async function handleRefresh() {
@@ -236,7 +258,7 @@ export default function CampaignDetailPage() {
                             Refresh
                         </button>
                         {(campaign.status === 'active' || campaign.status === 'draft') && queued > 0 && (
-                            <button onClick={handleSend} disabled={sending} title="Warning: This will immediately send all queued emails, ignoring your daily limits and scheduled delays." style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px', borderRadius: '10px', background: t.accent, color: '#fff', border: 'none', cursor: sending ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600, fontFamily: t.font }}>
+                            <button onClick={handleSend} disabled={sending} title="Send queued emails now. Scheduled time and office-hour checks are bypassed, but safety quotas remain enforced." style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px', borderRadius: '10px', background: t.accent, color: '#fff', border: 'none', cursor: sending ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600, fontFamily: t.font }}>
                                 <Send style={{ width: '13px', height: '13px' }} />
                                 {sending ? 'Sending…' : `Force Send All (${queued})`}
                             </button>
@@ -287,6 +309,12 @@ export default function CampaignDetailPage() {
                 </div>
             </div>
 
+            {sendNotice && (
+                <div style={{ padding: '13px 15px', borderRadius: '10px', border: `1px solid ${sendNotice.kind === 'error' ? t.coral : t.green}`, background: sendNotice.kind === 'error' ? t.coralSoft : t.greenSoft, color: sendNotice.kind === 'error' ? t.coral : t.green, fontSize: '13px', fontWeight: 600, lineHeight: 1.5 }}>
+                    {sendNotice.text}
+                </div>
+            )}
+
             {/* Stats row — responsive grid */}
             <div className="camp-detail-stats" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '12px' }}>
                 {[
@@ -319,7 +347,7 @@ export default function CampaignDetailPage() {
                         {campaign.status === 'active' && queued > 0 && (
                             <span style={{ color: t.accent, fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', textTransform: 'none', letterSpacing: 'normal' }}>
                                 <RefreshCw style={{ width: '10px', height: '10px', animation: 'spin 2s linear infinite' }} />
-                                Processing in background...
+                                {sending ? `Force sending ${sendProgress.sent}/${sendProgress.total}…` : 'Waiting for the scheduled worker…'}
                             </span>
                         )}
                     </span>
