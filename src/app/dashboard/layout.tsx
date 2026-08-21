@@ -1,6 +1,7 @@
 "use client";
 
 import Sidebar from "@/components/sidebar";
+import PlatformGuide from "@/components/platform-guide";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
 
 function DashboardContent({ children }: { children: React.ReactNode }) {
@@ -8,6 +9,7 @@ function DashboardContent({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ minHeight: '100vh', background: t.page, transition: 'background 300ms ease' }}>
       <Sidebar />
+      <PlatformGuide />
       {/* Desktop: margin-left for sidebar. Mobile: padding-top for top bar */}
       <main
         className="dash-main"

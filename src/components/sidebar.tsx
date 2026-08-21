@@ -4,43 +4,70 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-    LayoutDashboard, Send, Users, Globe, ListOrdered,
-    BarChart3, ShieldCheck, Settings, Zap, Sun, Moon, Menu, X, MessageSquare, Database, Megaphone
+    LayoutDashboard, Send, Users, Globe, ListOrdered, Mail, Rocket,
+    BarChart3, ShieldCheck, Settings, Zap, Sun, Moon, Menu, X, MessageSquare, Database, Megaphone, ChevronDown, ChevronUp
 } from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
 
-const navItems = [
-    { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
-    { label: "Marketing", href: "/dashboard/marketing", icon: Megaphone },
-    { label: "Landing Pages", href: "/dashboard/marketing?tab=landing-pages", icon: Globe },
+const startItems = [
+    { label: "Setup & Launch", href: "/dashboard/setup", icon: Rocket },
+    { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
+];
+const workflowItems = [
+    { label: "Landing Pages", href: "/dashboard/marketing?tab=landing-pages", activePath: "/dashboard/marketing", icon: Globe },
+    { label: "Leads", href: "/dashboard/contacts", icon: Users },
+    { label: "Email Campaigns", href: "/dashboard/campaigns", icon: Send },
     { label: "Automation", href: "/dashboard/automation", icon: Zap },
-    { label: "Campaigns", href: "/dashboard/campaigns", icon: Send },
-    { label: "Contacts", href: "/dashboard/contacts", icon: Users },
-    { label: "Categories", href: "/dashboard/categories", icon: ListOrdered },
-    { label: "Domains", href: "/dashboard/domains", icon: Globe },
-    { label: "Queue", href: "/dashboard/queue", icon: ListOrdered },
-    { label: "Inbox", href: "/dashboard/inbox", icon: MessageSquare },
-    { label: "Database", href: "/dashboard/database", icon: Database },
+    { label: "Queue & Delivery", href: "/dashboard/queue", icon: ListOrdered },
+];
+const resultsItems = [
     { label: "Analytics", href: "/dashboard/analytics", icon: BarChart3 },
+    { label: "Replies", href: "/dashboard/inbox", icon: MessageSquare },
+];
+const advancedItems = [
+    { label: "Marketing Studio", href: "/dashboard/marketing", icon: Megaphone },
+    { label: "Audiences", href: "/dashboard/categories", icon: ListOrdered },
+    { label: "Sending Domains", href: "/dashboard/domains", icon: Mail },
+    { label: "Database", href: "/dashboard/database", icon: Database },
+    { label: "Compliance", href: "/dashboard/compliance", icon: ShieldCheck },
 ];
 const bottomItems = [
-    { label: "Compliance", href: "/dashboard/compliance", icon: ShieldCheck },
     { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
 function SidebarContent({ onClose }: { onClose?: () => void }) {
     const pathname = usePathname();
     const { theme: t, isDark, toggleTheme } = useTheme();
+    const [advancedOpen, setAdvancedOpen] = useState(false);
+
+    const isActive = (item: { href: string; activePath?: string }) => {
+        const target = item.activePath || item.href.split("?")[0];
+        return target === "/dashboard" ? pathname === target : pathname === target || pathname.startsWith(`${target}/`);
+    };
+
+    const renderItems = (items: typeof workflowItems) => items.map((item) => {
+        const active = isActive(item);
+        const Icon = item.icon;
+        return (
+            <Link key={item.href} href={item.href} onClick={onClose}
+                style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', borderRadius: '8px', fontSize: '13px', fontWeight: active ? 600 : 500, fontFamily: t.font, textDecoration: 'none', transition: 'all 150ms ease', background: active ? t.accentSoft : 'transparent', color: active ? t.accent : t.textSec }}
+                onMouseEnter={(e) => { if (!active) { e.currentTarget.style.background = t.hover; e.currentTarget.style.color = t.text; } }}
+                onMouseLeave={(e) => { if (!active) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = t.textSec; } }}>
+                <Icon style={{ width: '16px', height: '16px', flexShrink: 0, color: active ? t.accent : t.textMuted }} />
+                {item.label}
+            </Link>
+        );
+    });
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             {/* Logo */}
             <div style={{ height: '60px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 20px', borderBottom: `1px solid ${t.sidebarBorder}`, flexShrink: 0 }}>
-                <Link href="/dashboard" onClick={onClose} style={{ display: 'flex', alignItems: 'center', gap: '10px', textDecoration: 'none' }}>
+                <Link href="/dashboard/setup" onClick={onClose} style={{ display: 'flex', alignItems: 'center', gap: '10px', textDecoration: 'none' }}>
                     <div style={{ width: '30px', height: '30px', borderRadius: '8px', background: t.accent, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <Zap style={{ width: '15px', height: '15px', color: isDark ? '#111110' : '#FFFFFF' }} />
                     </div>
-                    <span style={{ fontSize: '16px', fontWeight: 600, letterSpacing: '-0.025em', color: t.text, fontFamily: t.font }}>ColdReach</span>
+                    <span style={{ fontSize: '16px', fontWeight: 600, letterSpacing: '-0.025em', color: t.text, fontFamily: t.font }}>FinModel Sales</span>
                 </Link>
                 {/* Close button — mobile only */}
                 {onClose && (
@@ -52,25 +79,9 @@ function SidebarContent({ onClose }: { onClose?: () => void }) {
 
             {/* Nav */}
             <nav style={{ flex: 1, padding: '16px 12px', overflowY: 'auto', overflowX: 'hidden' }}>
-                <p style={{ padding: '0 12px', marginBottom: '8px', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: t.textMuted, fontFamily: t.font }}>Platform</p>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
-                    {navItems.map((item) => {
-                        const isActive = item.href === "/dashboard"
-                            ? pathname === "/dashboard"
-                            : pathname === item.href || pathname.startsWith(item.href + '/');
-                        const Icon = item.icon;
-                        return (
-                            <Link key={item.href} href={item.href} onClick={onClose}
-                                style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', borderRadius: '8px', fontSize: '13px', fontWeight: isActive ? 600 : 500, fontFamily: t.font, textDecoration: 'none', transition: 'all 150ms ease', background: isActive ? t.accentSoft : 'transparent', color: isActive ? t.accent : t.textSec }}
-                                onMouseEnter={(e) => { if (!isActive) { e.currentTarget.style.background = t.hover; e.currentTarget.style.color = t.text; } }}
-                                onMouseLeave={(e) => { if (!isActive) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = t.textSec; } }}
-                            >
-                                <Icon style={{ width: '16px', height: '16px', flexShrink: 0, color: isActive ? t.accent : t.textMuted }} />
-                                {item.label}
-                            </Link>
-                        );
-                    })}
-                </div>
+                {[{ label: "Start", items: startItems }, { label: "Sales workflow", items: workflowItems }, { label: "Results", items: resultsItems }].map((group) => <div key={group.label} style={{ marginBottom: 16 }}><p style={{ padding: '0 12px', margin: '0 0 6px', fontSize: '10px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: t.textMuted, fontFamily: t.font }}>{group.label}</p><div style={{ display: 'grid', gap: 1 }}>{renderItems(group.items)}</div></div>)}
+                <button onClick={() => setAdvancedOpen((value) => !value)} style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', border: 0, background: 'transparent', color: t.textMuted, cursor: 'pointer', fontSize: 10, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '.1em' }}>Advanced {advancedOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>
+                {advancedOpen && <div style={{ display: 'grid', gap: 1, marginTop: 3 }}>{renderItems(advancedItems)}</div>}
             </nav>
 
             {/* Bottom */}
@@ -123,11 +134,11 @@ export default function Sidebar() {
                 background: t.sidebar, borderBottom: `1px solid ${t.sidebarBorder}`,
                 alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', zIndex: 50,
             }}>
-                <Link href="/dashboard" style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none' }}>
+                <Link href="/dashboard/setup" style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none' }}>
                     <div style={{ width: '26px', height: '26px', borderRadius: '7px', background: t.accent, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <Zap style={{ width: '13px', height: '13px', color: '#FFF' }} />
                     </div>
-                    <span style={{ fontSize: '15px', fontWeight: 600, color: t.text }}>ColdReach</span>
+                    <span style={{ fontSize: '15px', fontWeight: 600, color: t.text }}>FinModel Sales</span>
                 </Link>
                 <button onClick={() => setMobileOpen(true)}
                     style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', color: t.textSec }}>

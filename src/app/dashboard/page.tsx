@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Users, Send, Clock, Mail, AlertTriangle, Calendar, ArrowUpRight, Activity, Globe, RefreshCw } from "lucide-react";
+import { Users, Send, Clock, Mail, AlertTriangle, Calendar, ArrowUpRight, Activity, Globe, RefreshCw, Rocket } from "lucide-react";
 import { useTheme, Theme } from "@/components/theme-provider";
 import {
     fetchDashboardStats, fetchDomainHealth, fetchCampaigns, fetchLiveQueue,
@@ -158,6 +158,14 @@ export default function DashboardPage() {
                     </div>
                 </div>
             </div>
+
+            <Link href="/dashboard/setup" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 18, padding: '18px 20px', borderRadius: 14, background: t.accentSoft, border: `1px solid ${t.accentBorder}`, textDecoration: 'none' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 13 }}>
+                    <div style={{ width: 38, height: 38, borderRadius: 11, background: t.accent, display: 'grid', placeItems: 'center', flexShrink: 0 }}><Rocket size={18} color="#fff" /></div>
+                    <div><div style={{ color: t.text, fontSize: 14, fontWeight: 700 }}>New here? Complete Setup & Launch</div><div style={{ color: t.textSec, fontSize: 12, marginTop: 3 }}>Follow the guided checklist and verify your real Vercel, Supabase, Resend and Meta setup.</div></div>
+                </div>
+                <ArrowUpRight size={18} color={t.accent} style={{ flexShrink: 0 }} />
+            </Link>
 
             {/* ── Stat Cards ─────────────────────────────── */}
             <div className="stat-grid">
