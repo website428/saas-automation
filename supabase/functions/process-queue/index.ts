@@ -48,7 +48,12 @@ function personalize(template: string, contact: PersonalizableContact): string {
         personalization: contact.personalization || '',
         personalized_line: contact.personalization || '',
     };
-    return template.replace(/\{([a-z_]+)\}/gi, (match, key: string) => values[key.toLowerCase()] ?? match);
+    const aliases: Record<string, string> = { first_name: 'name', full_name: 'name', fullname: 'name', organization: 'company', organisation: 'company', title: 'job_title' };
+    const withExcelTokens = template.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (match, rawKey: string) => {
+        const key = rawKey.trim().toLowerCase().replace(/[\s-]+/g, '_');
+        return values[aliases[key] || key] ?? match;
+    });
+    return withExcelTokens.replace(/\{([a-z_]+)\}/gi, (match, key: string) => values[key.toLowerCase()] ?? match);
 }
 
 // ── WARMUP CURVE ─────────────────────────────────────────────────────────────
@@ -220,15 +225,18 @@ Deno.serve(async (req: Request) => {
             // ── Fetch queued emails for this domain ────────────────────────────
             let query = supabase
                 .from('email_queue')
-                .select('*, campaigns(name, subject_a, body_html), contacts(name, email, status, company_name, job_title, website, personalization, custom_subject, custom_body)')
+                .select('*, campaigns!inner(name, status, subject_a, body_html, followup_subject, followup_body, followup2_subject, followup2_body), contacts(name, email, status, company_name, job_title, website, personalization, custom_subject, custom_body)')
                 .eq('domain_id', domain.id)
+                .eq('campaigns.status', 'active')
                 .eq('status', 'queued')
                 .lte('scheduled_at', new Date().toISOString())
                 .order('scheduled_at', { ascending: true })
                 .limit(slots * 2); // 2× to account for skips
 
             if (isForced && force_campaign_id) {
-                query = query.eq('campaign_id', force_campaign_id);
+                // A manual run may send initial messages now, but it must not
+                // bypass the delay or reply checks on automatic follow-ups.
+                query = query.eq('campaign_id', force_campaign_id).eq('sequence_step', 1);
             }
 
             const { data: queued } = await query;
@@ -238,7 +246,7 @@ Deno.serve(async (req: Request) => {
                 if (sentThisDomain >= slots) break;
 
                 const contact = item.contacts as PersonalizableContact | null;
-                const campaign = item.campaigns as { name: string; subject_a: string; body_html: string } | null;
+                const campaign = item.campaigns as { name: string; status: string; subject_a: string; body_html: string; followup_subject: string | null; followup_body: string | null; followup2_subject: string | null; followup2_body: string | null } | null;
                 if (!contact || !campaign) continue;
 
                 if (contact.status === 'unsubscribed' || contact.status === 'bounced') {
@@ -248,6 +256,72 @@ Deno.serve(async (req: Request) => {
                     }).eq('id', item.id);
                     log.skipped++;
                     continue;
+                }
+
+                if (item.sequence_step > 1) {
+                    const { data: replyThread } = await supabase
+                        .from('inbox_threads')
+                        .select('id')
+                        .eq('contact_id', item.contact_id)
+                        .eq('domain_id', item.domain_id)
+                        .limit(1)
+                        .maybeSingle();
+                    if (replyThread) {
+                        await supabase.from('email_queue').update({
+                            status: 'cancelled',
+                            error_message: 'Follow-up stopped: recipient replied',
+                        }).eq('contact_id', item.contact_id)
+                          .eq('domain_id', item.domain_id)
+                          .eq('status', 'queued')
+                          .gt('sequence_step', 1);
+                        log.skipped++;
+                        continue;
+                    }
+
+                    const { data: previousStep } = await supabase
+                        .from('email_queue')
+                        .select('status,sent_at')
+                        .eq('campaign_id', item.campaign_id)
+                        .eq('contact_id', item.contact_id)
+                        .eq('sequence_step', item.sequence_step - 1)
+                        .maybeSingle();
+                    if (!previousStep) {
+                        await supabase.from('email_queue').update({
+                            status: 'cancelled',
+                            error_message: 'Follow-up stopped: previous email is missing',
+                        }).eq('id', item.id);
+                        log.skipped++;
+                        continue;
+                    }
+
+                    if (['queued', 'sending'].includes(previousStep.status)) {
+                        await supabase.from('email_queue').update({
+                            scheduled_at: new Date(Date.now() + 6 * 3600000).toISOString(),
+                            error_message: 'Waiting for the previous email to send',
+                        }).eq('id', item.id);
+                        log.skipped++;
+                        continue;
+                    }
+
+                    const previousWasSent = ['sent', 'delivered', 'opened', 'clicked'].includes(previousStep.status);
+                    if (!previousWasSent || !previousStep.sent_at) {
+                        await supabase.from('email_queue').update({
+                            status: 'cancelled',
+                            error_message: `Follow-up stopped: previous email is ${previousStep.status}`,
+                        }).eq('id', item.id);
+                        log.skipped++;
+                        continue;
+                    }
+
+                    const earliestSend = new Date(previousStep.sent_at).getTime() + Math.max(1, item.wait_days || 1) * 86400000;
+                    if (Date.now() < earliestSend) {
+                        await supabase.from('email_queue').update({
+                            scheduled_at: new Date(earliestSend).toISOString(),
+                            error_message: 'Waiting for the configured follow-up delay',
+                        }).eq('id', item.id);
+                        log.skipped++;
+                        continue;
+                    }
                 }
 
                 // ── Role-based filter ──────────────────────────────────────────
@@ -287,8 +361,22 @@ Deno.serve(async (req: Request) => {
                 }
 
                 // ── Build email payload ────────────────────────────────────────
-                const finalSubject = personalize(contact.custom_subject?.trim() || campaign.subject_a, contact);
-                const finalBody = personalize(contact.custom_body?.trim() || campaign.body_html, contact);
+                // Prefer the campaign-specific snapshot captured when the Excel
+                // recipient was queued. Contact fields support older queue rows.
+                const campaignSubject = item.sequence_step === 2
+                    ? campaign.followup_subject || campaign.subject_a
+                    : item.sequence_step === 3
+                        ? campaign.followup2_subject || campaign.followup_subject || campaign.subject_a
+                        : campaign.subject_a;
+                const campaignBody = item.sequence_step === 2
+                    ? campaign.followup_body || campaign.body_html
+                    : item.sequence_step === 3
+                        ? campaign.followup2_body || campaign.followup_body || campaign.body_html
+                        : campaign.body_html;
+                const subjectTemplate = item.personalized_subject?.trim() || (item.sequence_step === 1 ? contact.custom_subject?.trim() : '') || campaignSubject;
+                const bodyTemplate = item.personalized_body?.trim() || (item.sequence_step === 1 ? contact.custom_body?.trim() : '') || campaignBody;
+                const finalSubject = personalize(subjectTemplate, contact);
+                const finalBody = personalize(bodyTemplate, contact);
 
                 const inboundAddress = `reply@${domain.domain_name}`;
                 const appBaseUrl = (Deno.env.get('APP_BASE_URL') || Deno.env.get('NEXT_PUBLIC_APP_URL') || '').replace(/\/$/, '');
@@ -334,7 +422,7 @@ Deno.serve(async (req: Request) => {
                             status: 'queued',
                             error_message: `Quota check failed: ${quotaError.message}`,
                         }).eq('id', item.id);
-                        log.errors.push('Account quota could not be checked. Apply migration 016. Sending stopped safely.');
+                        log.errors.push('Account quota could not be checked. Apply migration 023_quota_rpc_repair.sql, then retry. Sending stopped safely.');
                         break;
                     }
                     if (!reserved) {

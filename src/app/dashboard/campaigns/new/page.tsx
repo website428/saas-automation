@@ -271,6 +271,38 @@ const newCampStyles = `
   }
 `;
 
+function campaignSetupError(error: unknown, fallback = 'Could not prepare the campaign.') {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'object' && error && 'message' in error
+      ? String((error as { message?: unknown }).message || '')
+      : String(error || '');
+  if (/column\s+(?:public\.)?(?:contacts|campaigns|email_queue)\.[a-z0-9_]+\s+does not exist/i.test(message)
+      || /could not find the ['"]?[a-z0-9_]+['"]? column.*schema cache/i.test(message)) {
+    return 'The production database is missing the Excel automation columns. Run Supabase migration 022_excel_automation_schema_repair.sql, then refresh this page.';
+  }
+  return message || fallback;
+}
+
+function normalizeSpreadsheetTemplate(value: string) {
+  const aliases: Record<string, string> = {
+    first_name: 'name',
+    fullname: 'name',
+    full_name: 'name',
+    company_name: 'company',
+    organisation: 'company',
+    organization: 'company',
+    title: 'job_title',
+  };
+  return value.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (match, rawKey: string) => {
+    const key = rawKey.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    const normalized = aliases[key] || key;
+    return ['name', 'email', 'company', 'job_title', 'role', 'website', 'personalization', 'personalized_line'].includes(normalized)
+      ? `{${normalized}}`
+      : match;
+  });
+}
+
 export default function NewCampaignPage() {
   const { theme: t } = useTheme();
   const router = useRouter();
@@ -290,10 +322,16 @@ export default function NewCampaignPage() {
     personalization: string | null;
     custom_subject: string | null;
     custom_body: string | null;
+    custom_followup_1: string | null;
+    custom_followup_2: string | null;
     status: string;
   };
   const [contacts, setContacts] = useState<CampaignContact[]>([]);
   const [selectedContactIds, setSelectedContactIds] = useState<Set<string>>(new Set());
+  const [contactSource, setContactSource] = useState<'database' | 'spreadsheet'>('database');
+  const [contactReloadKey, setContactReloadKey] = useState(0);
+  const contactSourceRef = useRef<'database' | 'spreadsheet'>('database');
+  const contactRequestIdRef = useRef(0);
   const [previewContactId, setPreviewContactId] = useState("");
   const [rangeStart, setRangeStart] = useState<number | ''>('');
   const [rangeEnd, setRangeEnd] = useState<number | ''>('');
@@ -317,12 +355,17 @@ export default function NewCampaignPage() {
   const [bounceEnabled, setBounceEnabled] = useState(false);
   const [bouncePreview, setBouncePreview] = useState(false);
 
-  // ── Follow-up email (no-open) ────────────────────────────────────
+  // ── Automatic follow-up sequence (stops after reply/suppression) ─
   const [followUpSubject, setFollowUpSubject] = useState("");
   const [followUpBody, setFollowUpBody] = useState("");
   const [followUpEnabled, setFollowUpEnabled] = useState(false);
   const [followUpDelayDays, setFollowUpDelayDays] = useState<number>(3);
   const [followUpPreview, setFollowUpPreview] = useState(false);
+  const [followUp2Enabled, setFollowUp2Enabled] = useState(false);
+  const [followUp2Subject, setFollowUp2Subject] = useState("");
+  const [followUp2Body, setFollowUp2Body] = useState("");
+  const [followUp2DelayDays, setFollowUp2DelayDays] = useState<number>(4);
+  const [followUp2Preview, setFollowUp2Preview] = useState(false);
 
   // Per-recipient AI personalization (generation never sends email)
   const [personalizationBrief, setPersonalizationBrief] = useState("");
@@ -330,6 +373,8 @@ export default function NewCampaignPage() {
   const [personalizationStatus, setPersonalizationStatus] = useState("");
   const [sheetImporting, setSheetImporting] = useState(false);
   const [sheetImportStatus, setSheetImportStatus] = useState("");
+  const [sheetFileName, setSheetFileName] = useState("");
+  const [sheetReadyCount, setSheetReadyCount] = useState(0);
 
   // Per-product templates keyed by product_name
   const PRODUCT_TEMPLATES: Record<string, { subject: string; body: string }> = {
@@ -404,6 +449,8 @@ investorraise.com`,
 
   useEffect(() => {
     async function fetchAllContacts() {
+      if (contactSourceRef.current === 'spreadsheet') return;
+      const requestId = ++contactRequestIdRef.current;
       const PAGE_SIZE = 1000;
       let allContacts: CampaignContact[] = [];
       let from = 0;
@@ -412,7 +459,7 @@ investorraise.com`,
       while (hasMore) {
         let q = supabase
           .from('contacts')
-          .select('id,name,email,company_name,job_title,website,personalization,custom_subject,custom_body,status')
+          .select('id,name,email,company_name,job_title,website,personalization,custom_subject,custom_body,custom_followup_1,custom_followup_2,status')
           .eq('status', 'pending')
           .range(from, from + PAGE_SIZE - 1);
 
@@ -421,7 +468,10 @@ investorraise.com`,
         }
 
         const { data, error } = await q;
-        if (error || !data || data.length === 0) {
+        if (error) {
+          setError(campaignSetupError(error, 'Could not load contacts.'));
+          hasMore = false;
+        } else if (!data || data.length === 0) {
           hasMore = false;
         } else {
           allContacts = allContacts.concat(data);
@@ -433,14 +483,31 @@ investorraise.com`,
         }
       }
 
+      // A spreadsheet can finish importing while this paginated request is
+      // still running. Never let that stale all-contact result replace the
+      // exact spreadsheet list or its selection.
+      if (requestId !== contactRequestIdRef.current) return;
       setContacts(allContacts);
       setRecipientCount(allContacts.length);
-      setSelectedContactIds(new Set(allContacts.map(c => c.id)));
+      // Selecting every database contact by default is unsafe on large lists.
+      // Category results may be selected as a defined list; an unfiltered
+      // database view starts with nothing selected.
+      setSelectedContactIds(selectedCategories.size > 0 ? new Set(allContacts.map(c => c.id)) : new Set());
       setPreviewContactId(current => current || allContacts[0]?.id || '');
     }
 
     fetchAllContacts();
-  }, [selectedCategories]);
+  }, [selectedCategories, contactReloadKey]);
+
+  function chooseCategories(next: Set<string>) {
+    contactSourceRef.current = 'database';
+    contactRequestIdRef.current += 1;
+    setContactSource('database');
+    setSheetFileName('');
+    setSheetReadyCount(0);
+    setSheetImportStatus('');
+    setSelectedCategories(next);
+  }
 
   // Case-insensitive template lookup helper
   function findTemplate<T>(map: Record<string, T>, key: string): T | undefined {
@@ -525,12 +592,14 @@ investorraise.com`,
       personalization: null,
       custom_subject: null,
       custom_body: null,
+      custom_followup_1: null,
+      custom_followup_2: null,
     }).in('id', ids);
     if (clearError) {
       setError(clearError.message);
     } else {
       setContacts(previous => previous.map(contact => selectedContactIds.has(contact.id)
-        ? { ...contact, personalization: null, custom_subject: null, custom_body: null }
+        ? { ...contact, personalization: null, custom_subject: null, custom_body: null, custom_followup_1: null, custom_followup_2: null }
         : contact));
       setPersonalizationStatus(`Cleared personalized copy for ${ids.length} contacts.`);
     }
@@ -538,8 +607,14 @@ investorraise.com`,
   }
 
   async function importPersonalizedSheet(file: File) {
+    const previousSource = contactSourceRef.current;
+    contactSourceRef.current = 'spreadsheet';
+    contactRequestIdRef.current += 1;
+    setContactSource('spreadsheet');
     setSheetImporting(true);
     setSheetImportStatus('Reading spreadsheet…');
+    setSheetFileName('');
+    setSheetReadyCount(0);
     setError('');
 
     try {
@@ -553,14 +628,16 @@ investorraise.com`,
 
       const headers = rows[0].map(value => String(value).trim().toLowerCase());
       const column = (...aliases: string[]) => headers.findIndex(header => aliases.includes(header));
-      const emailIndex = column('email', 'email address', 'work email');
+      const emailIndex = column('email', 'email address', 'work email', 'existing email');
       const nameIndex = column('name', 'full name', 'contact name');
-      const subjectIndex = column('subject', 'email subject', 'custom subject');
+      const subjectIndex = column('subject', 'subject line', 'email subject', 'custom subject');
       const bodyIndex = column('body', 'email body', 'custom body', 'mail', 'email content', 'message');
       const companyIndex = column('company', 'company name', 'organization', 'organisation');
       const titleIndex = column('job title', 'title', 'role', 'position');
       const websiteIndex = column('website', 'company website', 'domain');
       const personalizationIndex = column('personalization', 'personalisation', 'personalized line', 'personalised line', 'icebreaker', 'opening line');
+      const followUp1Index = column('follow-up 1', 'follow up 1', 'followup 1', 'first follow-up', 'first follow up');
+      const followUp2Index = column('follow-up 2', 'follow up 2', 'followup 2', 'second follow-up', 'second follow up');
 
       if (emailIndex === -1 || subjectIndex === -1 || bodyIndex === -1) {
         throw new Error('Required columns: Email, Subject, and Body (or Mail). Name and Company are optional.');
@@ -569,14 +646,16 @@ investorraise.com`,
       const valueAt = (row: any[], index: number) => index >= 0 ? String(row[index] || '').trim() : '';
       const byEmail = new Map<string, any>();
       let invalidRows = 0;
+      let duplicateRows = 0;
       for (const row of rows.slice(1)) {
         const email = valueAt(row, emailIndex).toLowerCase();
-        const customSubject = valueAt(row, subjectIndex);
-        const customBody = valueAt(row, bodyIndex);
+        const customSubject = normalizeSpreadsheetTemplate(valueAt(row, subjectIndex));
+        const customBody = normalizeSpreadsheetTemplate(valueAt(row, bodyIndex));
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !customSubject || !customBody) {
           invalidRows++;
           continue;
         }
+        if (byEmail.has(email)) duplicateRows++;
         byEmail.set(email, {
           email,
           name: valueAt(row, nameIndex) || null,
@@ -586,6 +665,8 @@ investorraise.com`,
           personalization: valueAt(row, personalizationIndex) || null,
           custom_subject: customSubject,
           custom_body: customBody,
+          custom_followup_1: normalizeSpreadsheetTemplate(valueAt(row, followUp1Index)) || null,
+          custom_followup_2: normalizeSpreadsheetTemplate(valueAt(row, followUp2Index)) || null,
         });
       }
       const importedRows = Array.from(byEmail.values());
@@ -597,7 +678,7 @@ investorraise.com`,
         const emails = importedRows.slice(i, i + 200).map(row => row.email);
         const { data, error: lookupError } = await supabase
           .from('contacts')
-          .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,status')
+          .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,custom_followup_1,custom_followup_2,status')
           .in('email', emails);
         if (lookupError) throw lookupError;
         existing.push(...(data || []));
@@ -622,6 +703,8 @@ investorraise.com`,
           personalization: row.personalization || found.personalization,
           custom_subject: row.custom_subject,
           custom_body: row.custom_body,
+          custom_followup_1: row.custom_followup_1,
+          custom_followup_2: row.custom_followup_2,
         };
         existingUpdates.push({ found, fields });
       }
@@ -630,7 +713,7 @@ investorraise.com`,
         const results = await Promise.all(existingUpdates.slice(i, i + 20).map(async ({ found, fields }) => {
           const { data: updated, error: updateError } = await supabase
             .from('contacts').update(fields).eq('id', found.id)
-            .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,status')
+            .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,custom_followup_1,custom_followup_2,status')
             .single();
           if (updateError) throw updateError;
           return updated as CampaignContact;
@@ -642,28 +725,52 @@ investorraise.com`,
       for (let i = 0; i < newRows.length; i += 200) {
         const { data: created, error: createError } = await supabase
           .from('contacts').insert(newRows.slice(i, i + 200))
-          .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,status');
+          .select('id,email,name,company_name,job_title,website,personalization,custom_subject,custom_body,custom_followup_1,custom_followup_2,status');
         if (createError) throw createError;
         createdContacts.push(...((created || []) as CampaignContact[]));
       }
 
       const importedContacts = [...updatedContacts, ...createdContacts];
       const importedIds = new Set(importedContacts.map(contact => contact.id));
-      setContacts(previous => {
-        const importedEmailSet = new Set(importedContacts.map(contact => contact.email.toLowerCase()));
-        return [...previous.filter(contact => !importedEmailSet.has(contact.email.toLowerCase())), ...importedContacts];
-      });
+      // Spreadsheet mode deliberately shows only rows from this upload. It
+      // must never append the wider contact database to the campaign list.
+      setContacts(importedContacts);
+      setRecipientCount(importedContacts.length);
       const eligibleIds = new Set(importedContacts
         .filter(contact => !['bounced', 'unsubscribed'].includes(contact.status))
         .map(contact => contact.id));
       setSelectedContactIds(eligibleIds);
       if (importedContacts[0]) setPreviewContactId(importedContacts[0].id);
       setPreview(true);
+      setTemplateMode('plain');
+
+      // Make the spreadsheet workflow self-contained: every queue row uses its
+      // personalized snapshot, while these values serve as safe campaign-level
+      // fallbacks and make the campaign readable in the dashboard.
+      const firstImported = importedContacts.find(contact => eligibleIds.has(contact.id)) || importedContacts[0];
+      if (firstImported?.custom_subject) setSubject(firstImported.custom_subject);
+      if (firstImported?.custom_body) setBodyHtml(firstImported.custom_body);
+      const baseFileName = file.name.replace(/\.(xlsx|xls|csv)$/i, '').trim();
+      const dateLabel = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      setName(current => current.trim() || `${baseFileName} — ${dateLabel}`);
+      setSheetFileName(file.name);
+      setSheetReadyCount(eligibleIds.size);
+
+      const personalizedFollowUp1 = importedContacts.filter(contact => contact.custom_followup_1?.trim()).length;
+      const personalizedFollowUp2 = importedContacts.filter(contact => contact.custom_followup_2?.trim()).length;
+      if (personalizedFollowUp1 > 0) setFollowUpEnabled(true);
+      if (personalizedFollowUp2 > 0) {
+        setFollowUpEnabled(true);
+        setFollowUp2Enabled(true);
+      }
 
       const suppressed = importedIds.size - eligibleIds.size;
-      setSheetImportStatus(`✓ Loaded ${importedContacts.length} personalized emails${invalidRows ? `; skipped ${invalidRows} invalid rows` : ''}${suppressed ? `; suppressed ${suppressed} bounced/unsubscribed contacts` : ''}. Review, then launch.`);
+      setSheetImportStatus(`✓ Automation prepared for ${eligibleIds.size} recipients${personalizedFollowUp1 ? `; ${personalizedFollowUp1} follow-up 1` : ''}${personalizedFollowUp2 ? `; ${personalizedFollowUp2} follow-up 2` : ''}${invalidRows ? `; skipped ${invalidRows} invalid rows` : ''}${duplicateRows ? `; merged ${duplicateRows} duplicate email rows` : ''}${suppressed ? `; suppressed ${suppressed} bounced/unsubscribed contacts` : ''}. Review, then save a draft or activate the schedule.`);
     } catch (err: any) {
-      setError(err?.message || 'Could not import the personalized spreadsheet.');
+      contactSourceRef.current = previousSource;
+      setContactSource(previousSource);
+      if (previousSource === 'database') setContactReloadKey(value => value + 1);
+      setError(campaignSetupError(err, 'Could not import the personalized spreadsheet.'));
       setSheetImportStatus('');
     } finally {
       setSheetImporting(false);
@@ -677,17 +784,24 @@ investorraise.com`,
     if (!bodyHtml.trim()) { setError("Email body is required."); return; }
     if (bounceEnabled && !bounceSubject.trim()) { setError("Bounce email subject is required when enabled."); return; }
     if (bounceEnabled && !bounceBody.trim()) { setError("Bounce email body is required when enabled."); return; }
-    if (followUpEnabled && !followUpSubject.trim()) { setError("Follow-up email subject is required when enabled."); return; }
-    if (followUpEnabled && !followUpBody.trim()) { setError("Follow-up email body is required when enabled."); return; }
+    const selectedContacts = contacts.filter(c => selectedContactIds.has(c.id));
+    const hasFollowUp1Copy = selectedContacts.some(c => c.custom_followup_1?.trim()) || !!followUpBody.trim();
+    const hasFollowUp2Copy = selectedContacts.some(c => c.custom_followup_2?.trim()) || !!followUp2Body.trim();
+    if (followUpEnabled && !hasFollowUp1Copy) { setError("Add Follow-Up 1 copy in the portal or spreadsheet."); return; }
+    if (followUp2Enabled && !followUpEnabled) { setError("Enable Follow-Up 1 before Follow-Up 2."); return; }
+    if (followUp2Enabled && !hasFollowUp2Copy) { setError("Add Follow-Up 2 copy in the portal or spreadsheet."); return; }
 
-    setLoading(true); setError("");
+    setLoading(true); setSending(startNow); setError("");
 
     const { data: camp, error: cErr } = await supabase.from('campaigns').insert({
       name: name.trim(),
       domain_id: domainId,
       subject_a: subject.trim(),
       body_html: bodyHtml.trim(),
-      status: startNow ? 'active' : 'draft',
+      // Keep it as a draft until the complete queue has been written. This
+      // prevents the worker from seeing an active campaign with only a partial
+      // queue while a large spreadsheet is being inserted.
+      status: 'draft',
       total_contacts: sendingTo,
       // Bounce email
       bounce_email_enabled: bounceEnabled,
@@ -698,15 +812,19 @@ investorraise.com`,
       followup_subject: followUpEnabled ? followUpSubject.trim() : null,
       followup_body: followUpEnabled ? followUpBody.trim() : null,
       followup_delay_days: followUpEnabled ? followUpDelayDays : null,
+      followup2_email_enabled: followUpEnabled && followUp2Enabled,
+      followup2_subject: followUpEnabled && followUp2Enabled ? followUp2Subject.trim() || null : null,
+      followup2_body: followUpEnabled && followUp2Enabled ? followUp2Body.trim() || null : null,
+      followup2_delay_days: followUpEnabled && followUp2Enabled ? followUp2DelayDays : null,
     }).select().single();
 
     if (cErr || !camp) {
-      setError(cErr?.message || "Failed to create campaign.");
+      setError(campaignSetupError(cErr, "Failed to create campaign."));
       setLoading(false);
+      setSending(false);
       return;
     }
 
-    const selectedContacts = contacts.filter(c => selectedContactIds.has(c.id));
     if (selectedContacts.length > 0) {
       // ── Warmup-Safe Hourly-Tranche Scheduling (v5) ─────────────────────────
       //
@@ -775,6 +893,17 @@ investorraise.com`,
         return d;
       }
 
+      function followUpSlot(previous: Date, delayDays: number): Date {
+        const d = new Date(previous);
+        d.setDate(d.getDate() + delayDays);
+        if (d.getDay() === 0) d.setDate(d.getDate() + 1); // never schedule Sunday
+        return d;
+      }
+
+      function replySubject(value: string): string {
+        return /^re:/i.test(value.trim()) ? value.trim() : `Re: ${value.trim()}`;
+      }
+
       // Walk warmup curve to find how many days we need
       let tempIdx = 0, tempDay = 0;
       while (tempIdx < selectedContacts.length) {
@@ -803,26 +932,93 @@ investorraise.com`,
             sendAt = trancheSlot(nextDay, positionInDay, capacity);
           }
 
+          const initialSubject = c.custom_subject?.trim() || subject.trim();
           queueRows.push({
             campaign_id: camp.id,
             contact_id: c.id,
             domain_id: domainId,
+            personalized_subject: c.custom_subject?.trim() || null,
+            personalized_body: c.custom_body?.trim() || null,
             sequence_step: 1,
+            wait_days: 0,
             scheduled_at: sendAt.toISOString(),
             status: 'queued',
           });
+
+          const firstFollowUpBody = c.custom_followup_1?.trim() || followUpBody.trim();
+          if (followUpEnabled && firstFollowUpBody) {
+            const firstFollowUpAt = followUpSlot(sendAt, followUpDelayDays);
+            queueRows.push({
+              campaign_id: camp.id,
+              contact_id: c.id,
+              domain_id: domainId,
+              personalized_subject: followUpSubject.trim() || replySubject(initialSubject),
+              personalized_body: firstFollowUpBody,
+              sequence_step: 2,
+              wait_days: followUpDelayDays,
+              scheduled_at: firstFollowUpAt.toISOString(),
+              status: 'queued',
+            });
+
+            const secondFollowUpBody = c.custom_followup_2?.trim() || followUp2Body.trim();
+            if (followUp2Enabled && secondFollowUpBody) {
+              const secondFollowUpAt = followUpSlot(firstFollowUpAt, followUp2DelayDays);
+              queueRows.push({
+                campaign_id: camp.id,
+                contact_id: c.id,
+                domain_id: domainId,
+                personalized_subject: followUp2Subject.trim() || replySubject(initialSubject),
+                personalized_body: secondFollowUpBody,
+                sequence_step: 3,
+                wait_days: followUp2DelayDays,
+                scheduled_at: secondFollowUpAt.toISOString(),
+                status: 'queued',
+              });
+            }
+          }
         });
 
         idx += capacity;
         dayIndex++;
       }
 
-      // Single bulk insert — no N+1, works for 100 or 25,000 contacts
-      await supabase.from('email_queue').insert(queueRows);
+      // Insert in bounded chunks. A spreadsheet with 2,575 contacts and two
+      // follow-ups creates 7,725 queue rows; one giant PostgREST request can
+      // exceed the request-body limit and leave activation looking stuck.
+      const QUEUE_INSERT_CHUNK_SIZE = 200;
+      for (let offset = 0; offset < queueRows.length; offset += QUEUE_INSERT_CHUNK_SIZE) {
+        const chunk = queueRows.slice(offset, offset + QUEUE_INSERT_CHUNK_SIZE);
+        const { error: queueError } = await supabase.from('email_queue').insert(chunk);
+        if (queueError) {
+          // Campaign deletion cascades to any chunks already inserted, so a
+          // failed activation cannot leave a partial campaign behind.
+          const { error: cleanupError } = await supabase.from('campaigns').delete().eq('id', camp.id);
+          const cleanupMessage = cleanupError ? ` Cleanup also failed: ${cleanupError.message}` : '';
+          setError(`${campaignSetupError(queueError, 'Could not create the email sequence. Apply migration 022 and try again.')}${cleanupMessage}`);
+          setLoading(false);
+          setSending(false);
+          return;
+        }
+      }
     }
 
-    // Campaign is now active — the cron/queue worker will pick up and send
-    // emails on their individual scheduled_at times. No immediate blast.
+    if (startNow) {
+      const { error: activationError } = await supabase
+        .from('campaigns')
+        .update({ status: 'active', completed_at: null })
+        .eq('id', camp.id);
+      if (activationError) {
+        const { error: cleanupError } = await supabase.from('campaigns').delete().eq('id', camp.id);
+        const cleanupMessage = cleanupError ? ` Cleanup also failed: ${cleanupError.message}` : '';
+        setError(`${campaignSetupError(activationError, 'Campaign was saved but could not be activated.')}${cleanupMessage}`);
+        setLoading(false);
+        setSending(false);
+        return;
+      }
+    }
+
+    // The cron/queue worker will pick up active campaigns and send emails on
+    // their individual scheduled_at times. No immediate blast.
 
     router.push('/dashboard/campaigns');
   }
@@ -939,7 +1135,7 @@ investorraise.com`,
               <Tag style={{ width: '13px', height: '13px' }} />
               Target Categories
               <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>
-                — select one or more categories, or leave empty for all contacts
+                — select one or more categories; an unfiltered database list starts unselected
               </span>
             </div>
           </label>
@@ -964,7 +1160,7 @@ investorraise.com`,
                       onClick={() => {
                         const next = new Set(selectedCategories);
                         next.delete(catId);
-                        setSelectedCategories(next);
+                        chooseCategories(next);
                       }}
                       style={{
                         background: 'none', border: 'none', cursor: 'pointer', padding: '2px',
@@ -980,7 +1176,7 @@ investorraise.com`,
                 );
               })}
               <button
-                onClick={() => setSelectedCategories(new Set())}
+                onClick={() => chooseCategories(new Set())}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: '4px',
                   padding: '5px 12px', borderRadius: '20px',
@@ -1001,17 +1197,20 @@ investorraise.com`,
           <div ref={categoryDropdownRef} style={{ position: 'relative', zIndex: 50 }}>
             <button
               type="button"
+              disabled={contactSource === 'spreadsheet'}
               onClick={() => setCategoryDropdownOpen(v => !v)}
               style={{
                 ...inputStyle(t),
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                cursor: 'pointer', paddingRight: '36px',
+                cursor: contactSource === 'spreadsheet' ? 'default' : 'pointer', paddingRight: '36px',
                 background: categoryDropdownOpen ? t.cardInner : t.cardInner,
-                borderColor: categoryDropdownOpen ? t.accent : t.border,
+                borderColor: contactSource === 'spreadsheet' ? t.green : categoryDropdownOpen ? t.accent : t.border,
               }}
             >
-              <span style={{ color: selectedCategories.size === 0 ? t.textMuted : t.text, pointerEvents: 'none' }}>
-                {selectedCategories.size === 0
+              <span style={{ color: contactSource === 'spreadsheet' ? t.green : selectedCategories.size === 0 ? t.textMuted : t.text, pointerEvents: 'none' }}>
+                {contactSource === 'spreadsheet'
+                  ? `📄 Spreadsheet list only — ${contacts.length} imported contacts`
+                  : selectedCategories.size === 0
                   ? '📋 All Pending Contacts (no filter)'
                   : `${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'} selected`}
               </span>
@@ -1042,7 +1241,7 @@ investorraise.com`,
                   <span style={{ fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: t.textMuted }}>Mail Categories</span>
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <button
-                      onClick={() => setSelectedCategories(new Set(categories.map(c => c.id)))}
+                      onClick={() => chooseCategories(new Set(categories.map(c => c.id)))}
                       style={{
                         padding: '4px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 600,
                         background: t.accentSoft, border: `1px solid ${t.accent}44`, color: t.accent,
@@ -1050,7 +1249,7 @@ investorraise.com`,
                       }}
                     >Select All</button>
                     <button
-                      onClick={() => setSelectedCategories(new Set())}
+                      onClick={() => chooseCategories(new Set())}
                       style={{
                         padding: '4px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 600,
                         background: t.card, border: `1px solid ${t.border}`, color: t.textMuted,
@@ -1074,7 +1273,7 @@ investorraise.com`,
                           const next = new Set(selectedCategories);
                           if (isChecked) next.delete(cat.id);
                           else next.add(cat.id);
-                          setSelectedCategories(next);
+                          chooseCategories(next);
                         }}
                         style={{
                           display: 'flex', alignItems: 'center', gap: '12px', width: '100%',
@@ -1119,18 +1318,25 @@ investorraise.com`,
           </div>
 
           {/* Info line */}
-          <p style={{ marginTop: '8px', fontSize: '12px', color: t.textMuted }}>
-            {selectedCategories.size === 0
-              ? '📬 No filter applied — campaign will target all pending contacts'
-              : `🎯 Targeting contacts from ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}`}
-          </p>
+          {contactSource === 'spreadsheet' ? (
+            <div style={{ marginTop: '10px', padding: '10px 12px', borderRadius: '8px', background: t.greenSoft, border: `1px solid ${t.green}44`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '12px', color: t.green, fontWeight: 600 }}>✓ Locked to {contacts.length} rows from {sheetFileName || 'the uploaded spreadsheet'}. Database contacts are excluded.</span>
+              <button type="button" onClick={() => chooseCategories(new Set())} style={{ padding: '6px 9px', borderRadius: '7px', border: `1px solid ${t.border}`, background: t.card, color: t.textSec, fontSize: '11px', fontWeight: 600, cursor: 'pointer', fontFamily: t.font }}>Return to database contacts</button>
+            </div>
+          ) : (
+            <p style={{ marginTop: '8px', fontSize: '12px', color: t.textMuted }}>
+              {selectedCategories.size === 0
+                ? '📬 No filter applied — no contacts are selected by default. Choose a category, upload a spreadsheet, or select a range.'
+                : `🎯 Targeting contacts from ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}`}
+            </p>
+          )}
         </div>
 
         {/* Recipient count & selection */}
         {contacts.length > 0 && (
           <div style={{ ...card(t), padding: 0, overflow: 'hidden' }}>
             <div style={{ padding: '20px', borderBottom: `1px solid ${t.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: t.cardInner }}>
-              <label style={{ ...lbl(t), marginBottom: 0 }}>Select Contacts for Campaign</label>
+              <label style={{ ...lbl(t), marginBottom: 0 }}>{contactSource === 'spreadsheet' ? `Spreadsheet Contacts (${contacts.length})` : 'Select Contacts for Campaign'}</label>
               <div style={{ display: 'flex', gap: '8px' }}>
                 <button onClick={() => setSelectedContactIds(new Set(contacts.slice(0, 10).map(c => c.id)))}
                   style={{ padding: '6px 12px', borderRadius: '6px', fontSize: '11px', fontWeight: 600, background: t.card, border: `1px solid ${t.border}`, color: t.textSec, cursor: 'pointer' }}>
@@ -1245,8 +1451,8 @@ investorraise.com`,
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                 <FileSpreadsheet style={{ width: '18px', height: '18px', color: t.accent }} />
                 <div>
-                  <p style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: t.text }}>Upload prepared personalized emails</p>
-                  <p style={{ margin: '3px 0 0', fontSize: '11px', color: t.textMuted }}>Excel/CSV columns: Email, Subject, Body or Mail. Optional: Name, Company, Job Title, Website, Personalization.</p>
+                  <p style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: t.text }}>Excel Campaign Automation</p>
+                  <p style={{ margin: '3px 0 0', fontSize: '11px', color: t.textMuted }}>Upload one row per recipient. The portal validates contacts, saves personalized copy, creates the campaign, and schedules its follow-ups.</p>
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
@@ -1260,7 +1466,7 @@ investorraise.com`,
                 </a>
                 <label style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', padding: '9px 14px', borderRadius: '9px', background: t.cardInner, border: `1px solid ${t.accent}`, color: t.accent, fontSize: '12px', fontWeight: 700, cursor: sheetImporting ? 'wait' : 'pointer' }}>
                   <Upload style={{ width: '14px', height: '14px' }} />
-                  {sheetImporting ? 'Importing…' : 'Choose Excel / CSV'}
+                  {sheetImporting ? 'Preparing automation…' : 'Upload Excel / CSV'}
                   <input
                     type="file"
                     accept=".xlsx,.xls,.csv"
@@ -1276,7 +1482,51 @@ investorraise.com`,
                 </label>
               </div>
             </div>
-            {sheetImportStatus && <p style={{ margin: '10px 0 0', fontSize: '12px', color: sheetImportStatus.startsWith('✓') ? t.green : t.textMuted }}>{sheetImportStatus}</p>}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px', marginTop: '12px' }}>
+              {[
+                ['1', 'Upload file'],
+                ['2', 'Validate rows'],
+                ['3', 'Review previews'],
+                ['4', 'Activate schedule'],
+              ].map(([number, label], index) => {
+                const complete = sheetReadyCount > 0 && index < 2;
+                return (
+                  <div key={number} style={{ padding: '9px 10px', borderRadius: '8px', border: `1px solid ${complete ? t.green : t.border}`, background: complete ? t.greenSoft : t.cardInner, fontSize: '11px', color: complete ? t.green : t.textMuted, fontWeight: 600 }}>
+                    <span style={{ marginRight: '5px' }}>{complete ? '✓' : number}.</span>{label}
+                  </div>
+                );
+              })}
+            </div>
+            {sheetImportStatus && <p style={{ margin: '10px 0 0', fontSize: '12px', color: sheetImportStatus.startsWith('✓') ? t.green : t.textMuted, lineHeight: 1.5 }}>{sheetImportStatus}</p>}
+            {sheetReadyCount > 0 && (
+              <div style={{ marginTop: '12px', padding: '12px', borderRadius: '9px', background: t.greenSoft, border: `1px solid ${t.green}55` }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+                  <div>
+                    <p style={{ margin: 0, fontSize: '12px', fontWeight: 700, color: t.green }}>{sheetReadyCount} recipients ready</p>
+                    <p style={{ margin: '3px 0 0', fontSize: '11px', color: t.textMuted }}>{sheetFileName} · Campaign name and fallback copy were filled automatically.</p>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => handleCreate(false)}
+                      disabled={loading || !domainId}
+                      style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${t.border}`, background: t.card, color: t.text, fontSize: '11px', fontWeight: 700, cursor: loading ? 'wait' : 'pointer', fontFamily: t.font }}
+                    >
+                      {loading && !sending ? 'Creating draft…' : 'Create automation draft'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCreate(true)}
+                      disabled={loading || !domainId}
+                      style={{ padding: '8px 12px', borderRadius: '8px', border: 'none', background: t.green, color: '#fff', fontSize: '11px', fontWeight: 700, cursor: loading ? 'wait' : 'pointer', fontFamily: t.font }}
+                    >
+                      {loading && sending ? 'Activating…' : 'Activate automated schedule'}
+                    </button>
+                  </div>
+                </div>
+                <p style={{ margin: '9px 0 0', fontSize: '10px', color: t.textMuted, lineHeight: 1.5 }}>Activation schedules the initial messages from tomorrow within the selected domain’s sending window. It does not blast emails immediately. Daily limits and reply suppression remain enforced.</p>
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '0 0 16px' }}>
             <div style={{ height: '1px', background: t.border, flex: 1 }} />
@@ -1498,13 +1748,16 @@ investorraise.com`,
                 <RefreshCw style={{ width: '16px', height: '16px', color: t.amber }} />
               </div>
               <div>
-                <p style={{ margin: 0, fontSize: '14px', fontWeight: 700, color: t.text }}>Follow-up Email <span style={{ fontSize: '11px', fontWeight: 500, color: t.amber, marginLeft: '6px', background: t.amberSoft, border: `1px solid ${t.amber}44`, borderRadius: '20px', padding: '2px 8px' }}>if not opened</span></p>
-                <p style={{ margin: '2px 0 0', fontSize: '12px', color: t.textMuted }}>Send a follow-up if the recipient never opened your first email</p>
+                <p style={{ margin: 0, fontSize: '14px', fontWeight: 700, color: t.text }}>Automatic Follow-up Sequence <span style={{ fontSize: '11px', fontWeight: 500, color: t.amber, marginLeft: '6px', background: t.amberSoft, border: `1px solid ${t.amber}44`, borderRadius: '20px', padding: '2px 8px' }}>stops on reply</span></p>
+                <p style={{ margin: '2px 0 0', fontSize: '12px', color: t.textMuted }}>Queue up to two respectful follow-ups and cancel them automatically after a reply, bounce, complaint, or unsubscribe.</p>
               </div>
             </div>
             {/* Toggle */}
             <button
-              onClick={() => setFollowUpEnabled(v => !v)}
+              onClick={() => setFollowUpEnabled(v => {
+                if (v) setFollowUp2Enabled(false);
+                return !v;
+              })}
               style={{ flexShrink: 0, width: '44px', height: '24px', borderRadius: '12px', border: 'none', cursor: 'pointer', position: 'relative', background: followUpEnabled ? t.amber : t.border, transition: 'background 200ms' }}
             >
               <span style={{ position: 'absolute', top: '3px', left: followUpEnabled ? '23px' : '3px', width: '18px', height: '18px', borderRadius: '50%', background: '#fff', transition: 'left 200ms', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
@@ -1523,11 +1776,11 @@ investorraise.com`,
                   onChange={e => setFollowUpDelayDays(Math.max(1, Math.min(30, Number(e.target.value) || 1)))}
                   style={{ width: '60px', padding: '5px 10px', borderRadius: '8px', border: `1px solid ${t.amber}55`, background: t.card, color: t.text, fontSize: '13px', fontWeight: 700, textAlign: 'center' }}
                 />
-                <span style={{ fontSize: '13px', color: t.textMuted }}>day{followUpDelayDays === 1 ? '' : 's'} if recipient has not opened</span>
+                <span style={{ fontSize: '13px', color: t.textMuted }}>day{followUpDelayDays === 1 ? '' : 's'} after the initial email if there is no reply</span>
               </div>
 
               <div>
-                <label style={lbl(t)}>Follow-up Subject <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>— use {'{name}'} for personalisation</span></label>
+                <label style={lbl(t)}>Follow-up 1 Subject <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>— optional; defaults to Re: original subject</span></label>
                 <input
                   value={followUpSubject}
                   onChange={e => setFollowUpSubject(e.target.value)}
@@ -1539,7 +1792,7 @@ investorraise.com`,
               </div>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                  <label style={{ ...lbl(t), marginBottom: 0 }}>Follow-up Email Body</label>
+                  <label style={{ ...lbl(t), marginBottom: 0 }}>Follow-up 1 Body <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>— spreadsheet copy overrides this fallback</span></label>
                   <button onClick={() => setFollowUpPreview(p => !p)}
                     style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 12px', borderRadius: '8px', border: `1px solid ${t.border}`, background: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 500, color: t.textSec, fontFamily: t.font }}>
                     {followUpPreview ? <EyeOff style={{ width: '13px', height: '13px' }} /> : <Eye style={{ width: '13px', height: '13px' }} />}
@@ -1549,7 +1802,7 @@ investorraise.com`,
                 {followUpPreview ? (
                   <div style={{ border: `1px solid ${t.border}`, borderRadius: '10px', overflow: 'hidden', minHeight: '160px' }}>
                     <pre style={{ margin: 0, padding: '20px 24px', background: '#fff', fontSize: '14px', lineHeight: 1.8, color: '#111', whiteSpace: 'pre-wrap', fontFamily: 'Georgia,serif' }}>
-                      {followUpBody.replace(/\{name\}/gi, contacts[0]?.name || 'there')}
+                      {personalizePreview(previewContact?.custom_followup_1?.trim() || followUpBody, previewContact)}
                     </pre>
                   </div>
                 ) : (
@@ -1564,8 +1817,58 @@ investorraise.com`,
                   />
                 )}
               </div>
+              <div style={{ padding: '14px', borderRadius: '10px', border: `1px solid ${t.border}`, background: t.cardInner }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                  <div>
+                    <p style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: t.text }}>Follow-up 2</p>
+                    <p style={{ margin: '3px 0 0', fontSize: '11px', color: t.textMuted }}>Optional final message after Follow-up 1.</p>
+                  </div>
+                  <button
+                    onClick={() => setFollowUp2Enabled(value => !value)}
+                    style={{ flexShrink: 0, width: '44px', height: '24px', borderRadius: '12px', border: 'none', cursor: 'pointer', position: 'relative', background: followUp2Enabled ? t.amber : t.border }}
+                  >
+                    <span style={{ position: 'absolute', top: '3px', left: followUp2Enabled ? '23px' : '3px', width: '18px', height: '18px', borderRadius: '50%', background: '#fff', transition: 'left 200ms', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
+                  </button>
+                </div>
+
+                {followUp2Enabled && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '14px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                      <Clock style={{ width: '15px', height: '15px', color: t.amber }} />
+                      <span style={{ fontSize: '12px', color: t.text }}>Wait</span>
+                      <input
+                        type="number" min={1} max={30}
+                        value={followUp2DelayDays}
+                        onChange={e => setFollowUp2DelayDays(Math.max(1, Math.min(30, Number(e.target.value) || 1)))}
+                        style={{ width: '60px', padding: '5px 10px', borderRadius: '8px', border: `1px solid ${t.amber}55`, background: t.card, color: t.text, fontSize: '13px', fontWeight: 700, textAlign: 'center' }}
+                      />
+                      <span style={{ fontSize: '12px', color: t.textMuted }}>day{followUp2DelayDays === 1 ? '' : 's'} after Follow-up 1</span>
+                    </div>
+                    <div>
+                      <label style={lbl(t)}>Follow-up 2 Subject <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>— optional; defaults to Re: original subject</span></label>
+                      <input value={followUp2Subject} onChange={e => setFollowUp2Subject(e.target.value)} placeholder="Final follow-up" style={inputStyle(t)} />
+                    </div>
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <label style={{ ...lbl(t), marginBottom: 0 }}>Follow-up 2 Body <span style={{ fontSize: '11px', color: t.textMuted, fontWeight: 400 }}>— spreadsheet copy overrides this fallback</span></label>
+                        <button onClick={() => setFollowUp2Preview(value => !value)} style={{ padding: '5px 12px', borderRadius: '8px', border: `1px solid ${t.border}`, background: 'none', cursor: 'pointer', fontSize: '12px', color: t.textSec }}>
+                          {followUp2Preview ? 'Edit' : 'Preview'}
+                        </button>
+                      </div>
+                      {followUp2Preview ? (
+                        <pre style={{ margin: 0, padding: '16px', border: `1px solid ${t.border}`, borderRadius: '10px', background: '#fff', color: '#111', whiteSpace: 'pre-wrap', fontFamily: 'Georgia,serif', minHeight: '120px' }}>
+                          {personalizePreview(previewContact?.custom_followup_2?.trim() || followUp2Body, previewContact)}
+                        </pre>
+                      ) : (
+                        <textarea value={followUp2Body} onChange={e => setFollowUp2Body(e.target.value)} rows={5} placeholder={`Hi {name},\n\nI’ll close the loop here. If this becomes relevant later, I’d be happy to share a focused example.\n\nBest,\nYour Team`} style={{ ...inputStyle(t), resize: 'vertical', lineHeight: 1.6 }} />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div style={{ padding: '10px 14px', borderRadius: '8px', background: t.amberSoft, border: `1px solid ${t.amber}22`, fontSize: '12px', color: t.amber, fontWeight: 500 }}>
-                📬 The follow-up will only be sent to contacts who haven't opened the original email after {followUpDelayDays} day{followUpDelayDays === 1 ? '' : 's'}.
+                📬 Follow-ups are sent only after the previous step was actually sent. Any reply, bounce, complaint, or unsubscribe cancels all remaining steps.
               </div>
             </div>
           )}
@@ -1593,7 +1896,7 @@ investorraise.com`,
         <button onClick={() => handleCreate(true)} disabled={loading || contacts.length === 0}
           style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 22px', borderRadius: '10px', background: t.accent, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: (loading || contacts.length === 0) ? 'not-allowed' : 'pointer', border: 'none', fontFamily: t.font, opacity: contacts.length === 0 ? 0.5 : 1 }}>
           <Send style={{ width: '14px', height: '14px' }} />
-          {sending ? 'Sending…' : `Launch & Send to ${sendingTo} Contact${sendingTo !== 1 ? 's' : ''}`}
+          {sending ? 'Activating…' : `Activate & Schedule ${sendingTo} Contact${sendingTo !== 1 ? 's' : ''}`}
         </button>
       </div>
     </div>

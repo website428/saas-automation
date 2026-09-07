@@ -5,8 +5,34 @@ import { useTheme, Theme } from "@/components/theme-provider";
 import { supabase } from "@/lib/supabase";
 import {
     Globe, ShieldAlert, ShieldCheck, Zap, AlertCircle,
-    Pause, Play, Trash2, Clock, Activity
+    Pause, Play, Trash2, Clock, Activity, RefreshCw
 } from "lucide-react";
+
+type ReputationDomain = {
+    domain: string;
+    overall: 'good' | 'warning' | 'blocked';
+    configuredInPortal: boolean;
+    portal: null | {
+        status: string;
+        healthScore: number;
+        bounceRate: number;
+        complaints30d: number;
+    };
+    resend: null | {
+        status: string;
+        records: Array<{ record?: string; type?: string; status?: string }>;
+    };
+    dmarc: { status: 'present' | 'missing' | 'unavailable'; policy: string | null; host: string };
+    blacklist: { status: 'listed' | 'not_listed' | 'unavailable'; detail: string };
+    findings: string[];
+};
+
+type ReputationReport = {
+    checkedAt: string;
+    summary: { total: number; good: number; warning: number; blocked: number };
+    domains: ReputationDomain[];
+    note: string;
+};
 
 function card(t: Theme): React.CSSProperties {
     return { background: t.card, border: `1px solid ${t.border}`, borderRadius: '14px', padding: '24px', boxShadow: '0 1px 3px rgba(0,0,0,0.02)' };
@@ -22,6 +48,9 @@ export default function DomainsPage() {
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [killConfirm, setKillConfirm] = useState<string | null>(null);
     const [editRegionModal, setEditRegionModal] = useState<{id: string, start: number, end: number} | null>(null);
+    const [reputation, setReputation] = useState<ReputationReport | null>(null);
+    const [reputationLoading, setReputationLoading] = useState(false);
+    const [reputationError, setReputationError] = useState('');
 
     const REGIONS = [
         { id: "india", label: "India (9 AM - 6 PM)", start: 9, end: 18, flag: "🇮🇳" },
@@ -42,6 +71,21 @@ export default function DomainsPage() {
         setLoading(false);
     }
     useEffect(() => { load(); }, []);
+
+    async function checkAllDomains() {
+        setReputationLoading(true);
+        setReputationError('');
+        try {
+            const response = await fetch('/api/domains/reputation', { cache: 'no-store' });
+            const json = await response.json();
+            if (!response.ok) throw new Error(json.error || 'Could not check domains.');
+            setReputation(json);
+        } catch (error) {
+            setReputationError(error instanceof Error ? error.message : 'Could not check domains.');
+        } finally {
+            setReputationLoading(false);
+        }
+    }
 
     async function pauseDomain(id: string) {
         setActionLoading(id + '_pause');
@@ -128,9 +172,77 @@ export default function DomainsPage() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div>
                     <h1 style={{ fontSize: '26px', fontWeight: 700, letterSpacing: '-0.03em', color: t.text, margin: 0 }}>Sending Domains</h1>
-                    <p style={{ marginTop: '6px', fontSize: '14px', color: t.textMuted }}>Monitor health, warmup progress, and control each domain.</p>
+                    <p style={{ marginTop: '6px', fontSize: '14px', color: t.textMuted }}>Monitor provider verification, authentication, blacklist signals, and delivery health.</p>
                 </div>
+                <button
+                    onClick={checkAllDomains}
+                    disabled={reputationLoading}
+                    style={{ padding: '10px 16px', borderRadius: '9px', border: `1px solid ${t.accent}`, background: t.accentSoft, color: t.accent, fontSize: '13px', fontWeight: 700, cursor: reputationLoading ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: '7px', fontFamily: t.font }}
+                >
+                    <RefreshCw style={{ width: '14px', height: '14px' }} />
+                    {reputationLoading ? 'Checking…' : 'Check All Domains'}
+                </button>
             </div>
+
+            {reputationError && (
+                <div style={{ ...card(t), padding: '14px 18px', color: t.coral, background: t.coralSoft }}>
+                    <AlertCircle style={{ width: '15px', height: '15px', verticalAlign: 'middle', marginRight: '7px' }} />
+                    {reputationError}
+                </div>
+            )}
+
+            {reputation && (
+                <div style={{ ...card(t), display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                        <div>
+                            <h2 style={{ margin: 0, fontSize: '17px', color: t.text }}>Live Reputation Check</h2>
+                            <p style={{ margin: '5px 0 0', fontSize: '12px', color: t.textMuted }}>
+                                Checked {new Date(reputation.checkedAt).toLocaleString()} · Resend, DNS/DMARC, Spamhaus DBL, and portal events
+                            </p>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                            <span style={{ padding: '5px 10px', borderRadius: '12px', background: t.greenSoft, color: t.green, fontSize: '12px', fontWeight: 700 }}>{reputation.summary.good} good</span>
+                            <span style={{ padding: '5px 10px', borderRadius: '12px', background: t.amberSoft, color: t.amber, fontSize: '12px', fontWeight: 700 }}>{reputation.summary.warning} warning</span>
+                            <span style={{ padding: '5px 10px', borderRadius: '12px', background: t.coralSoft, color: t.coral, fontSize: '12px', fontWeight: 700 }}>{reputation.summary.blocked} blocked</span>
+                        </div>
+                    </div>
+
+                    <div style={{ display: 'grid', gap: '10px' }}>
+                        {reputation.domains.map((result) => {
+                            const resultColor = result.overall === 'good' ? t.green : result.overall === 'warning' ? t.amber : t.coral;
+                            const resultBg = result.overall === 'good' ? t.greenSoft : result.overall === 'warning' ? t.amberSoft : t.coralSoft;
+                            const failedRecords = result.resend?.records.filter(record => record.status !== 'verified') || [];
+                            return (
+                                <div key={result.domain} style={{ padding: '14px 16px', border: `1px solid ${t.border}`, borderRadius: '10px', background: t.cardInner }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                        <div>
+                                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                                <strong style={{ color: t.text, fontSize: '14px' }}>{result.domain}</strong>
+                                                {!result.configuredInPortal && <span style={{ color: t.textMuted, fontSize: '11px' }}>Resend only</span>}
+                                            </div>
+                                            <p style={{ margin: '5px 0 0', color: t.textSec, fontSize: '12px' }}>
+                                                Resend: <strong>{result.resend?.status || 'missing'}</strong>
+                                                {' · '}DMARC: <strong>{result.dmarc.status === 'present' ? `p=${result.dmarc.policy}` : result.dmarc.status}</strong>
+                                                {' · '}Spamhaus: <strong>{result.blacklist.status.replace('_', ' ')}</strong>
+                                                {result.portal && ` · Bounce: ${result.portal.bounceRate}% · Complaints (30d): ${result.portal.complaints30d}`}
+                                            </p>
+                                        </div>
+                                        <span style={{ padding: '5px 10px', borderRadius: '12px', color: resultColor, background: resultBg, fontSize: '11px', fontWeight: 800, textTransform: 'uppercase' }}>
+                                            {result.overall === 'blocked' ? 'Do not send' : result.overall}
+                                        </span>
+                                    </div>
+                                    <ul style={{ margin: '9px 0 0', paddingLeft: '18px', color: t.textMuted, fontSize: '12px', lineHeight: 1.55 }}>
+                                        {result.findings.map((finding) => <li key={finding}>{finding}</li>)}
+                                        {failedRecords.length > 0 && <li>Failed records: {failedRecords.map(record => `${record.record || record.type} (${record.status})`).join(', ')}</li>}
+                                    </ul>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    <p style={{ margin: 0, fontSize: '11px', color: t.textMuted }}>{reputation.note}</p>
+                </div>
+            )}
 
             {/* Global kill switch */}
             {domains.some(d => d.status !== 'paused') && (

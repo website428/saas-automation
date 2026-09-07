@@ -343,6 +343,14 @@ Deno.serve(async (req) => {
             body: body || '(reply received)',
         });
 
+        await supabase.from('email_queue').update({
+            status: 'cancelled',
+            error_message: 'Follow-up stopped: recipient replied',
+        }).eq('contact_id', queueItem.contact_id)
+          .eq('domain_id', queueItem.domain_id)
+          .eq('status', 'queued')
+          .gt('sequence_step', 1);
+
         console.log(`Reply captured: thread=${threadId} from=${fromEmail}`);
 
         return new Response(JSON.stringify({ received: true, matched: true, threadId }), {

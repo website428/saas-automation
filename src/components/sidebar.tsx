@@ -5,17 +5,17 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
     LayoutDashboard, Send, Users, Globe, ListOrdered, Mail, Rocket,
-    BarChart3, ShieldCheck, Settings, Zap, Sun, Moon, Menu, X, MessageSquare, Database, Megaphone, ChevronDown, ChevronUp
+    BarChart3, ShieldCheck, Settings, Zap, Sun, Moon, Menu, X, MessageSquare, Database, Megaphone, ChevronDown, ChevronUp, Target
 } from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
 
 const startItems = [
     { label: "Setup & Launch", href: "/dashboard/setup", icon: Rocket },
+    { label: "Sales Today", href: "/dashboard/growth", icon: Target },
     { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
 ];
 const workflowItems = [
     { label: "Landing Pages", href: "/dashboard/marketing?tab=landing-pages", activePath: "/dashboard/marketing", icon: Globe },
-    { label: "Leads", href: "/dashboard/contacts", icon: Users },
     { label: "Email Campaigns", href: "/dashboard/campaigns", icon: Send },
     { label: "Automation", href: "/dashboard/automation", icon: Zap },
     { label: "Queue & Delivery", href: "/dashboard/queue", icon: ListOrdered },
@@ -25,6 +25,7 @@ const resultsItems = [
     { label: "Replies", href: "/dashboard/inbox", icon: MessageSquare },
 ];
 const advancedItems = [
+    { label: "All Contacts", href: "/dashboard/contacts", icon: Users },
     { label: "Marketing Studio", href: "/dashboard/marketing", icon: Megaphone },
     { label: "Audiences", href: "/dashboard/categories", icon: ListOrdered },
     { label: "Sending Domains", href: "/dashboard/domains", icon: Mail },

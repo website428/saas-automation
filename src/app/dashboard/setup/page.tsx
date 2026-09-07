@@ -22,7 +22,7 @@ type SetupStatus = {
         recentLeadEvent: { status: string; campaign_id: string | null; created_at: string; error_message?: string | null } | null;
         recentQueueItem: { status: string; created_at: string; campaign_id: string } | null;
     };
-    checks: { database: boolean; sender: boolean; landingPage: boolean; campaign: boolean; automation: boolean; endToEnd: boolean };
+    checks: { database: boolean; excelAutomationSchema: boolean; sender: boolean; landingPage: boolean; campaign: boolean; automation: boolean; endToEnd: boolean };
 };
 
 type ManualChecks = { cron: boolean; meta: boolean };
@@ -138,7 +138,7 @@ export default function SetupPage() {
 
             <div style={{ display: "grid", gap: 12 }}>
                 <StepCard number={1} title="Connect the platform" ready={steps[0]} actionHref="/dashboard/database" actionLabel="Open Database Status">
-                    <ol><li>Add Supabase URL, service-role key, app URL and admin secret in Vercel.</li><li>Run database migrations 001–019 in Supabase.</li><li>Redeploy, then click <b>Check setup</b> above.</li></ol>
+                    <ol><li>Add Supabase URL, service-role key, app URL and admin secret in Vercel.</li><li>Run every migration through <b>024_finasoft_growth_engine.sql</b> in Supabase.</li><li>Redeploy, then click <b>Check setup</b> above.</li></ol>
                 </StepCard>
                 <StepCard number={2} title="Connect email delivery" ready={steps[1]} actionHref="/dashboard/domains" actionLabel="Open Sending Domains">
                     <ol><li>Verify your sending subdomain in Resend.</li><li>Add RESEND_API_KEY and RESEND_WEBHOOK_SECRET in Vercel.</li><li>Confirm one sender domain shows Warming or Warm.</li></ol>
@@ -153,7 +153,7 @@ export default function SetupPage() {
                     {status?.resources.campaigns[0] && <p style={{ color: t.green, marginBottom: 0 }}>Active: {status.resources.campaigns[0].name}</p>}
                 </StepCard>
                 <StepCard number={5} title="Connect new leads to the campaign" ready={steps[4]} actionHref="/dashboard/automation" actionLabel="Open Automation">
-                    <ol><li>Find the <b>lead_created</b> rule.</li><li>Select your active welcome campaign.</li><li>Enable the rule, choose the delay, and save.</li></ol>
+                    <ol><li>Connect <b>lead_created</b> to your standard welcome campaign.</li><li>Optionally connect <b>qualified_lead</b> and <b>hot_lead</b> to stronger, faster sequences.</li><li>Enable each rule, choose the delay, and save.</li></ol>
                     {status?.resources.linkedCampaign && <p style={{ color: t.green, marginBottom: 0 }}>Connected to {status.resources.linkedCampaign.name} with a {status.resources.leadRule?.delay_minutes || 0}-minute delay.</p>}
                 </StepCard>
                 <StepCard number={6} title="Confirm the 24×7 queue worker" ready={steps[5]} actionHref="/dashboard/queue" actionLabel="Open Email Queue">
@@ -170,15 +170,33 @@ export default function SetupPage() {
                 </StepCard>
             </div>
 
+            <section style={{ marginTop: 18, padding: 20, borderRadius: 14, background: t.card, border: `1px solid ${t.border}` }}>
+                <h2 style={{ margin: "0 0 6px", color: t.text, fontSize: 17 }}>Your Finasoft acquisition pages</h2>
+                <p style={{ margin: "0 0 14px", color: t.textSec, fontSize: 13 }}>Use one page per audience. Add UTM parameters to the URL so Sales Today can report the source.</p>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Link href="/ai-automation" target="_blank" style={{ padding: "9px 12px", borderRadius: 8, background: t.cardInner, color: t.text, textDecoration: "none", fontSize: 12, fontWeight: 700 }}>AI Automation Audit ↗</Link>
+                    <Link href="/ai-mvp" target="_blank" style={{ padding: "9px 12px", borderRadius: 8, background: t.cardInner, color: t.text, textDecoration: "none", fontSize: 12, fontWeight: 700 }}>AI MVP Review ↗</Link>
+                    <Link href="/healthcare-ai" target="_blank" style={{ padding: "9px 12px", borderRadius: 8, background: t.cardInner, color: t.text, textDecoration: "none", fontSize: 12, fontWeight: 700 }}>Healthcare AI Audit ↗</Link>
+                    <Link href="/dashboard/growth" style={{ padding: "9px 12px", borderRadius: 8, background: t.accent, color: "#fff", textDecoration: "none", fontSize: 12, fontWeight: 700 }}>Open Sales Today →</Link>
+                </div>
+            </section>
+
+            <section style={{ marginTop: 18, padding: 20, borderRadius: 14, background: t.card, border: `1px solid ${t.border}` }}>
+                <h2 style={{ margin: "0 0 6px", color: t.text, fontSize: 17 }}>Meta lead form fields</h2>
+                <p style={{ margin: "0 0 13px", color: t.textSec, fontSize: 13 }}>In Meta Ads Manager, keep <b>email</b> and <b>full_name</b> required. Add the fields below as custom questions so the platform can score and route the lead.</p>
+                <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>{["phone_number", "company_name", "company_website", "job_title", "industry", "requirement", "problem_statement", "budget_band", "timeline", "decision_maker", "employee_count", "repetitive_workflows", "manual_hours_weekly", "hourly_cost"].map(fieldName => <code key={fieldName} style={{ padding: "5px 8px", borderRadius: 6, background: t.cardInner, color: t.textSec, fontSize: 11 }}>{fieldName}</code>)}</div>
+                <p style={{ margin: "13px 0 0", color: t.textMuted, fontSize: 12 }}>Webhook URL: <code>/api/webhooks/meta</code>. Meta sends the lead here, the platform fetches the complete record, calculates the score, creates the audit and task, then enrolls the lead in the matching campaign.</p>
+            </section>
+
             <section style={{ marginTop: 18, padding: 20, borderRadius: 14, background: t.accentSoft, border: `1px solid ${t.accentBorder}` }}>
                 <h2 style={{ margin: "0 0 12px", color: t.text, fontSize: 17 }}>What happens automatically after launch</h2>
                 <div className="setup-flow" style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 }}>
-                    {[[Megaphone, "Meta ad"], [TestTube2, "Lead form"], [Settings2, "Automation"], [Mail, "Email queue"], [Send, "Resend sends"]].map(([Icon, label], index) => {
+                    {[[Megaphone, "Traffic"], [TestTube2, "AI audit"], [Settings2, "Lead score"], [Mail, "Email automation"], [Send, "Sales pipeline"]].map(([Icon, label], index) => {
                         const FlowIcon = Icon as typeof Mail;
                         return <div key={String(label)} style={{ padding: 12, borderRadius: 10, background: t.card, color: t.text, textAlign: "center", fontSize: 12, fontWeight: 700 }}><FlowIcon size={17} color={t.accent} style={{ marginBottom: 6 }} /><div>{String(label)}</div>{index < 4 && <span className="flow-arrow" style={{ color: t.textMuted }}>→</span>}</div>;
                     })}
                 </div>
-                <p style={{ color: t.textSec, fontSize: 13, lineHeight: 1.6, margin: "13px 0 0" }}>You only monitor Leads, Queue, Replies and Analytics. The landing form creates the contact, the lead automation assigns the campaign, and the cron worker sends due emails through Resend.</p>
+                <p style={{ color: t.textSec, fontSize: 13, lineHeight: 1.6, margin: "13px 0 0" }}>The audit calculates opportunity and lead quality, assigns the right email path, creates urgent follow-up tasks for hot leads, records booking requests and places every opportunity in Sales Today.</p>
             </section>
 
             <style>{`

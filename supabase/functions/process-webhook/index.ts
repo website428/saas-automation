@@ -112,6 +112,13 @@ Deno.serve(async (req) => {
                     .eq('id', queueItem.contact_id);
                 await supabase.rpc('increment_campaign_bounced', { cid: queueItem.campaign_id });
                 await updateDomainHealth(queueItem.domain_id);
+                await supabase.from('email_queue').update({
+                    status: 'cancelled',
+                    error_message: 'Follow-up stopped: previous email bounced',
+                }).eq('contact_id', queueItem.contact_id)
+                  .eq('domain_id', queueItem.domain_id)
+                  .eq('status', 'queued')
+                  .gt('sequence_step', 1);
             }
             if (newStatus === 'complained') {
                 await supabase.from('contacts')
@@ -120,6 +127,13 @@ Deno.serve(async (req) => {
                 await supabase.from('domains')
                     .update({ status: 'paused', health_score: 0 })
                     .eq('id', queueItem.domain_id);
+                await supabase.from('email_queue').update({
+                    status: 'cancelled',
+                    error_message: 'Follow-up stopped: spam complaint',
+                }).eq('contact_id', queueItem.contact_id)
+                  .eq('domain_id', queueItem.domain_id)
+                  .eq('status', 'queued')
+                  .gt('sequence_step', 1);
             }
         }
 
@@ -252,6 +266,14 @@ async function handleReply(
             });
         }
     }
+
+    await supabase.from('email_queue').update({
+        status: 'cancelled',
+        error_message: 'Follow-up stopped: recipient replied',
+    }).eq('contact_id', queueItem.contact_id)
+      .eq('domain_id', queueItem.domain_id)
+      .eq('status', 'queued')
+      .gt('sequence_step', 1);
 }
 
 async function updateDomainHealth(domainId: string) {

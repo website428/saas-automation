@@ -29,7 +29,12 @@ function personalize(template: string, contact: PersonalizableContact): string {
         personalization: contact.personalization || '',
         personalized_line: contact.personalization || '',
     };
-    return template.replace(/\{([a-z_]+)\}/gi, (match, key: string) => values[key.toLowerCase()] ?? match);
+    const aliases: Record<string, string> = { first_name: 'name', full_name: 'name', fullname: 'name', organization: 'company', organisation: 'company', title: 'job_title' };
+    const withExcelTokens = template.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (match, rawKey: string) => {
+        const key = rawKey.trim().toLowerCase().replace(/[\s-]+/g, '_');
+        return values[aliases[key] || key] ?? match;
+    });
+    return withExcelTokens.replace(/\{([a-z_]+)\}/gi, (match, key: string) => values[key.toLowerCase()] ?? match);
 }
 
 function isHtml(body: string): boolean {
@@ -124,6 +129,9 @@ export async function POST(req: NextRequest) {
             .eq('id', campaignId)
             .single();
         if (cErr || !campaign) return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
+        if (!force && campaign.status !== 'active') {
+            return NextResponse.json({ error: 'Campaign is not active', sent: 0 }, { status: 409 });
+        }
 
         const domain = campaign.domains as any;
         if (!domain) return NextResponse.json({ error: 'Domain not found' }, { status: 404 });
@@ -166,9 +174,12 @@ export async function POST(req: NextRequest) {
             .order('scheduled_at', { ascending: true })
             .limit(batchSize);
 
-        // Apply schedule filter ONLY if not forced
+        // Manual force-send is for initial emails only. Follow-ups must always
+        // respect their delay and reply-suppression checks.
         if (!force) {
             query = query.lte('scheduled_at', nowIso);
+        } else {
+            query = query.eq('sequence_step', 1);
         }
 
         const { data: queued, error: qErr } = await query;
@@ -198,6 +209,69 @@ export async function POST(req: NextRequest) {
                 continue;
             }
 
+            if (item.sequence_step > 1) {
+                // Any inbound thread for this contact/domain means the person has
+                // replied. Cancel every remaining follow-up before sending.
+                const { data: replyThread } = await serverSupabase
+                    .from('inbox_threads')
+                    .select('id')
+                    .eq('contact_id', item.contact_id)
+                    .eq('domain_id', item.domain_id)
+                    .limit(1)
+                    .maybeSingle();
+                if (replyThread) {
+                    await serverSupabase.from('email_queue').update({
+                        status: 'cancelled',
+                        error_message: 'Follow-up stopped: recipient replied',
+                    }).eq('contact_id', item.contact_id)
+                      .eq('domain_id', item.domain_id)
+                      .eq('status', 'queued')
+                      .gt('sequence_step', 1);
+                    continue;
+                }
+
+                const { data: previousStep } = await serverSupabase
+                    .from('email_queue')
+                    .select('status,sent_at')
+                    .eq('campaign_id', item.campaign_id)
+                    .eq('contact_id', item.contact_id)
+                    .eq('sequence_step', item.sequence_step - 1)
+                    .maybeSingle();
+                if (!previousStep) {
+                    await serverSupabase.from('email_queue').update({
+                        status: 'cancelled',
+                        error_message: 'Follow-up stopped: previous email is missing',
+                    }).eq('id', item.id);
+                    continue;
+                }
+
+                if (['queued', 'sending'].includes(previousStep.status)) {
+                    await serverSupabase.from('email_queue').update({
+                        scheduled_at: new Date(Date.now() + 6 * 3600000).toISOString(),
+                        error_message: 'Waiting for the previous email to send',
+                    }).eq('id', item.id);
+                    continue;
+                }
+
+                const previousWasSent = ['sent', 'delivered', 'opened', 'clicked'].includes(previousStep.status);
+                if (!previousWasSent || !previousStep.sent_at) {
+                    await serverSupabase.from('email_queue').update({
+                        status: 'cancelled',
+                        error_message: `Follow-up stopped: previous email is ${previousStep.status}`,
+                    }).eq('id', item.id);
+                    continue;
+                }
+
+                const earliestSend = new Date(previousStep.sent_at).getTime() + Math.max(1, item.wait_days || 1) * 86400000;
+                if (Date.now() < earliestSend) {
+                    await serverSupabase.from('email_queue').update({
+                        scheduled_at: new Date(earliestSend).toISOString(),
+                        error_message: 'Waiting for the configured follow-up delay',
+                    }).eq('id', item.id);
+                    continue;
+                }
+            }
+
             // ── RE-FETCH LIVE COUNTER before each send (prevents race conditions
             //    when multiple cron calls run concurrently for different campaigns
             //    that share the same domain) ──
@@ -221,8 +295,21 @@ export async function POST(req: NextRequest) {
                 .maybeSingle();
             if (!claimed) continue;
 
-            const pickSubject = contact.custom_subject?.trim() || campaign.subject_a;
-            const pickBody = contact.custom_body?.trim() || campaign.body_html;
+            // New campaigns snapshot the uploaded Excel copy on the queue row.
+            // Contact-level values remain as a fallback for queues created before
+            // migration 018 was applied.
+            const campaignSubject = item.sequence_step === 2
+                ? campaign.followup_subject || campaign.subject_a
+                : item.sequence_step === 3
+                    ? campaign.followup2_subject || campaign.followup_subject || campaign.subject_a
+                    : campaign.subject_a;
+            const campaignBody = item.sequence_step === 2
+                ? campaign.followup_body || campaign.body_html
+                : item.sequence_step === 3
+                    ? campaign.followup2_body || campaign.followup_body || campaign.body_html
+                    : campaign.body_html;
+            const pickSubject = item.personalized_subject?.trim() || (item.sequence_step === 1 ? contact.custom_subject?.trim() : '') || campaignSubject;
+            const pickBody = item.personalized_body?.trim() || (item.sequence_step === 1 ? contact.custom_body?.trim() : '') || campaignBody;
             const finalSubject = personalize(pickSubject, contact);
             const finalBody = personalize(pickBody, contact);
 

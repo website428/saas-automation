@@ -8,11 +8,36 @@ import { supabase } from "@/lib/supabase";
 import { formatQueueTime } from "@/lib/data";
 import { ArrowLeft, Send, Clock, CheckCircle, AlertTriangle, RefreshCw, Trash2, Mail, Eye, MousePointerClick, XCircle } from "lucide-react";
 
+function toDateTimeLocalValue(date: Date): string {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function card(t: Theme): React.CSSProperties {
     return { background: t.card, border: `1px solid ${t.border}`, borderRadius: '14px', padding: '24px', boxShadow: '0 1px 3px rgba(0,0,0,0.02)' };
 }
 function lbl(t: Theme): React.CSSProperties {
     return { fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: t.textMuted, fontFamily: t.font };
+}
+
+function personalizeQueuedContent(template: string, contact: any): string {
+    const values: Record<string, string> = {
+        name: contact?.name || 'there',
+        email: contact?.email || '',
+        company: contact?.company_name || 'your company',
+        company_name: contact?.company_name || 'your company',
+        job_title: contact?.job_title || '',
+        role: contact?.job_title || '',
+        website: contact?.website || '',
+        personalization: contact?.personalization || '',
+        personalized_line: contact?.personalization || '',
+    };
+    const aliases: Record<string, string> = { first_name: 'name', full_name: 'name', fullname: 'name', organization: 'company', organisation: 'company', title: 'job_title' };
+    const withExcelTokens = (template || '').replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (match, rawKey: string) => {
+        const key = rawKey.trim().toLowerCase().replace(/[\s-]+/g, '_');
+        return values[aliases[key] || key] ?? match;
+    });
+    return withExcelTokens.replace(/\{([a-z_]+)\}/gi, (match, key: string) => values[key.toLowerCase()] ?? match);
 }
 
 function StatusBadge({ status, t }: { status: string; t: Theme }) {
@@ -90,6 +115,7 @@ export default function CampaignDetailPage() {
 
     const [campaign, setCampaign] = useState<any>(null);
     const [queue, setQueue] = useState<any[]>([]);
+    const [previewQueueId, setPreviewQueueId] = useState('');
     const [recentOpens, setRecentOpens] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const [sending, setSending] = useState(false);
@@ -98,17 +124,24 @@ export default function CampaignDetailPage() {
     const [refreshing, setRefreshing] = useState(false);
     const [deleting, setDeleting] = useState(false);
     const [confirmDelete, setConfirmDelete] = useState(false);
+    const [scheduling, setScheduling] = useState(false);
+    const [scheduleAt, setScheduleAt] = useState(() => toDateTimeLocalValue(new Date(Date.now() + 5 * 60 * 1000)));
     const [sendNotice, setSendNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
     const autoSendRef = useRef(false);
 
     async function load() {
         const [campRes, queueRes, opensRes] = await Promise.all([
-            supabase.from('campaigns').select('*, domains(domain_name, from_email, daily_limit)').eq('id', campaignId).single(),
-            supabase.from('email_queue').select('*, contacts(name, email)').eq('campaign_id', campaignId).order('scheduled_at', { ascending: true }),
+            supabase.from('campaigns').select('*, domains(domain_name, from_email, daily_limit, send_hour_start, send_hour_end)').eq('id', campaignId).single(),
+            supabase.from('email_queue').select('*, contacts(name, email, company_name, job_title, website, personalization)').eq('campaign_id', campaignId).order('scheduled_at', { ascending: true }),
             supabase.from('email_opens').select('opened_at, contacts(name, email)').eq('campaign_id', campaignId).order('opened_at', { ascending: false }).limit(50),
         ]);
         if (campRes.data) setCampaign(campRes.data);
-        if (queueRes.data) setQueue(queueRes.data);
+        if (queueRes.data) {
+            setQueue(queueRes.data);
+            setPreviewQueueId(current => queueRes.data?.some(item => item.id === current)
+                ? current
+                : queueRes.data?.find(item => item.sequence_step === 1)?.id || queueRes.data?.[0]?.id || '');
+        }
         if (opensRes.data) setRecentOpens(opensRes.data);
         setLoading(false);
     }
@@ -199,6 +232,48 @@ export default function CampaignDetailPage() {
         setRefreshing(false);
     }
 
+    async function handleSchedule() {
+        const scheduledDate = new Date(scheduleAt);
+        if (!scheduleAt || Number.isNaN(scheduledDate.getTime())) {
+            setSendNotice({ kind: 'error', text: 'Choose a valid date and time.' });
+            return;
+        }
+        if (scheduledDate.getTime() <= Date.now()) {
+            setSendNotice({ kind: 'error', text: 'Choose a future time so the scheduled worker can pick it up.' });
+            return;
+        }
+        if (scheduledDate.getDay() === 0) {
+            setSendNotice({ kind: 'error', text: 'Sunday sending is disabled. Choose Monday through Saturday.' });
+            return;
+        }
+
+        setScheduling(true);
+        setSendNotice(null);
+        try {
+            const { data: updatedCount, error: queueError } = await supabase.rpc('schedule_campaign_initial_emails', {
+                target_campaign_id: campaignId,
+                requested_start_at: scheduledDate.toISOString(),
+            });
+            if (queueError) throw new Error(`${queueError.message} Apply the updated migration 023_quota_rpc_repair.sql.`);
+
+            const { error: campaignError } = await supabase
+                .from('campaigns')
+                .update({ status: 'active', completed_at: null })
+                .eq('id', campaignId);
+            if (campaignError) throw new Error(campaignError.message);
+
+            setSendNotice({
+                kind: 'success',
+                text: `Scheduled ${updatedCount ?? initialQueue.filter(item => item.status === 'queued').length} initial emails from ${scheduledDate.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}, spread across the working hours. Normal sending limits still apply.`,
+            });
+            await load();
+        } catch (e: any) {
+            setSendNotice({ kind: 'error', text: e?.message || 'Could not save the campaign schedule.' });
+        } finally {
+            setScheduling(false);
+        }
+    }
+
     async function handleDelete() {
         setDeleting(true);
         try {
@@ -233,6 +308,23 @@ export default function CampaignDetailPage() {
     const queued = queue.filter(q => q.status === 'queued').length;
     const sent = queue.filter(q => q.status === 'sent').length;
     const failed = queue.filter(q => q.status === 'failed').length;
+    const initialQueue = queue.filter(item => item.sequence_step === 1);
+    const personalizedInitialCount = initialQueue.filter(item => item.personalized_subject?.trim() && item.personalized_body?.trim()).length;
+    const previewQueueItem = queue.find(item => item.id === previewQueueId) || initialQueue[0] || queue[0] || null;
+    const previewStep = previewQueueItem?.sequence_step || 1;
+    const previewFallbackSubject = previewStep === 1
+        ? campaign.subject_a
+        : previewStep === 2
+            ? campaign.followup_subject || `Re: ${campaign.subject_a}`
+            : campaign.followup2_subject || `Re: ${campaign.subject_a}`;
+    const previewFallbackBody = previewStep === 1
+        ? campaign.body_html
+        : previewStep === 2
+            ? campaign.followup_body || ''
+            : campaign.followup2_body || '';
+    const previewSubject = personalizeQueuedContent(previewQueueItem?.personalized_subject?.trim() || previewFallbackSubject || '', previewQueueItem?.contacts);
+    const previewBody = personalizeQueuedContent(previewQueueItem?.personalized_body?.trim() || previewFallbackBody || '', previewQueueItem?.contacts);
+    const previewHasUnresolvedTokens = /\{\{?[^{}]+\}\}?/.test(previewSubject) || /\{\{?[^{}]+\}\}?/.test(previewBody);
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '24px', fontFamily: t.font, maxWidth: '900px' }}>
@@ -339,6 +431,46 @@ export default function CampaignDetailPage() {
                 ))}
             </div>
 
+            {/* Normal scheduled sending — does not bypass time windows or quotas */}
+            {queued > 0 && !['completed', 'aborted'].includes(campaign.status) && (
+                <div style={card(t)}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
+                        <div style={{ flex: 1, minWidth: '240px' }}>
+                            <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 700, color: t.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <Clock style={{ width: '16px', height: '16px', color: t.accent }} />
+                                Send on your schedule
+                            </h3>
+                            <p style={{ margin: '7px 0 0', fontSize: '12px', lineHeight: 1.5, color: t.textMuted }}>
+                                Choose when the initial emails become eligible. The regular worker will send them gradually and still enforce office hours, domain limits, account quota, and reply suppression.
+                            </p>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'end', gap: '8px', flexWrap: 'wrap' }}>
+                            <label style={{ display: 'flex', flexDirection: 'column', gap: '5px', fontSize: '11px', color: t.textMuted, fontWeight: 600 }}>
+                                Start date and time
+                                <input
+                                    type="datetime-local"
+                                    value={scheduleAt}
+                                    min={toDateTimeLocalValue(new Date())}
+                                    onChange={e => setScheduleAt(e.target.value)}
+                                    disabled={scheduling || sending || deleting}
+                                    style={{ padding: '9px 10px', borderRadius: '8px', border: `1px solid ${t.border}`, background: t.cardInner, color: t.text, fontFamily: t.font, fontSize: '12px' }}
+                                />
+                            </label>
+                            <button
+                                onClick={handleSchedule}
+                                disabled={scheduling || sending || deleting}
+                                style={{ padding: '10px 14px', borderRadius: '8px', border: 'none', background: t.green, color: '#fff', fontSize: '12px', fontWeight: 700, cursor: scheduling ? 'wait' : 'pointer', fontFamily: t.font }}
+                            >
+                                {scheduling ? 'Saving…' : 'Schedule campaign'}
+                            </button>
+                        </div>
+                    </div>
+                    <p style={{ margin: '10px 0 0', fontSize: '11px', color: t.textMuted }}>
+                        Domain window: {campaign.domains?.send_hour_start ?? 9}:00–{campaign.domains?.send_hour_end ?? 20}:00 IST · Sunday sending is disabled.
+                    </p>
+                </div>
+            )}
+
             {/* Progress bar */}
             <div style={card(t)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
@@ -407,7 +539,7 @@ export default function CampaignDetailPage() {
             <div style={card(t)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                     <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 600, color: t.text }}>Email Queue</h3>
-                    <span style={{ fontSize: '12px', color: t.textMuted }}>{queue.length} contacts</span>
+                    <span style={{ fontSize: '12px', color: t.textMuted }}>{initialQueue.length} recipients · {queue.length} scheduled messages</span>
                 </div>
                 <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' as any }}>
                     <div style={{ minWidth: '600px' }}>
@@ -427,18 +559,53 @@ export default function CampaignDetailPage() {
 
             {/* Email preview */}
             <div style={card(t)}>
-                <h3 style={{ margin: '0 0 16px', fontSize: '15px', fontWeight: 600, color: t.text }}>Email Content</h3>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap', marginBottom: '16px' }}>
+                    <div>
+                        <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 600, color: t.text }}>Recipient Email Preview</h3>
+                        <p style={{ margin: '5px 0 0', fontSize: '12px', color: t.textMuted }}>
+                            {personalizedInitialCount} of {initialQueue.length} initial emails have recipient-specific subject and body snapshots.
+                        </p>
+                    </div>
+                    {queue.length > 0 && (
+                        <select
+                            value={previewQueueItem?.id || ''}
+                            onChange={event => setPreviewQueueId(event.target.value)}
+                            style={{ minWidth: '280px', maxWidth: '100%', padding: '9px 32px 9px 11px', borderRadius: '9px', border: `1px solid ${t.border}`, background: t.cardInner, color: t.text, fontSize: '12px', fontFamily: t.font }}
+                        >
+                            {queue.map(item => {
+                                const stepLabel = item.sequence_step === 1 ? 'Initial' : `Follow-up ${item.sequence_step - 1}`;
+                                const recipient = item.contacts?.company_name || item.contacts?.name || item.contacts?.email || 'Unknown recipient';
+                                return <option key={item.id} value={item.id}>{recipient} — {stepLabel}</option>;
+                            })}
+                        </select>
+                    )}
+                </div>
+                <div style={{ marginBottom: '14px', padding: '10px 12px', borderRadius: '8px', background: personalizedInitialCount === initialQueue.length && initialQueue.length > 0 ? t.greenSoft : t.amberSoft, border: `1px solid ${personalizedInitialCount === initialQueue.length && initialQueue.length > 0 ? t.green : t.amber}44`, color: personalizedInitialCount === initialQueue.length && initialQueue.length > 0 ? t.green : t.amber, fontSize: '12px', lineHeight: 1.5 }}>
+                    {personalizedInitialCount === initialQueue.length && initialQueue.length > 0
+                        ? `✓ Each of the ${initialQueue.length} recipients has its own saved initial subject and body. The selector above shows the exact queued copy for each company.`
+                        : `Some recipients use the campaign fallback. Review the selector above before activating this draft.`}
+                </div>
+                {previewQueueItem && (
+                    <p style={{ margin: '0 0 12px', fontSize: '12px', color: t.textMuted }}>
+                        Showing <strong style={{ color: t.text }}>{previewQueueItem.contacts?.company_name || previewQueueItem.contacts?.name || previewQueueItem.contacts?.email}</strong> · {previewStep === 1 ? 'Initial email' : `Follow-up ${previewStep - 1}`} · {previewQueueItem.contacts?.email}
+                    </p>
+                )}
+                {previewHasUnresolvedTokens && (
+                    <div style={{ marginBottom: '12px', padding: '10px 12px', borderRadius: '8px', background: t.coralSoft, border: `1px solid ${t.coral}55`, color: t.coral, fontSize: '12px', fontWeight: 600 }}>
+                        An unsupported placeholder remains in this message. Correct it before sending.
+                    </div>
+                )}
                 <div style={{ marginBottom: '10px' }}>
                     <p style={lbl(t)}>Subject</p>
-                    <p style={{ margin: '6px 0 0', fontSize: '14px', color: t.text }}>{campaign.subject_a}</p>
+                    <p style={{ margin: '6px 0 0', fontSize: '14px', color: t.text }}>{previewSubject || '—'}</p>
                 </div>
                 <div>
                     <p style={lbl(t)}>Body</p>
-                    {campaign.body_html?.startsWith('<!DOCTYPE') || campaign.body_html?.startsWith('<html') ? (
-                        <iframe srcDoc={campaign.body_html} style={{ width: '100%', minHeight: '300px', border: `1px solid ${t.border}`, borderRadius: '8px', marginTop: '6px' }} title="Email body" />
+                    {previewBody.startsWith('<!DOCTYPE') || previewBody.startsWith('<html') ? (
+                        <iframe srcDoc={previewBody} style={{ width: '100%', minHeight: '300px', border: `1px solid ${t.border}`, borderRadius: '8px', marginTop: '6px' }} title="Email body" />
                     ) : (
                         <pre style={{ margin: '6px 0 0', padding: '16px', background: t.cardInner, borderRadius: '10px', fontSize: '13px', lineHeight: 1.8, color: t.textSec, whiteSpace: 'pre-wrap', fontFamily: t.font }}>
-                            {campaign.body_html}
+                            {previewBody || 'No body saved for this step.'}
                         </pre>
                     )}
                 </div>

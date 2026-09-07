@@ -341,6 +341,16 @@ export async function POST(req: NextRequest) {
             body,
         });
 
+        // A real reply is the strongest stop signal. Cancel all remaining
+        // automated follow-ups for this contact on this sending domain.
+        await supabase.from('email_queue').update({
+            status: 'cancelled',
+            error_message: 'Follow-up stopped: recipient replied',
+        }).eq('contact_id', queueItem.contact_id)
+          .eq('domain_id', queueItem.domain_id)
+          .eq('status', 'queued')
+          .gt('sequence_step', 1);
+
         console.log(`[inbound] Reply captured: thread=${threadId} from=${fromEmail}`);
         return NextResponse.json({ received: true, matched: true, threadId });
 

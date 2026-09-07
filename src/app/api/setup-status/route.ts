@@ -19,16 +19,21 @@ export async function GET(request: NextRequest) {
     }
 
     try {
-        const [pages, campaigns, domains, rule, recentEvent, recentQueue] = await Promise.all([
+        const [pages, campaigns, domains, rule, recentEvent, recentQueue, contactSchema, campaignSchema, queueSchema, growthSchema] = await Promise.all([
             serverSupabase.from("landing_pages").select("id,name,slug,status").eq("status", "published").order("updated_at", { ascending: false }).limit(5),
             serverSupabase.from("campaigns").select("id,name,status").eq("status", "active").order("created_at", { ascending: false }).limit(10),
             serverSupabase.from("domains").select("id,domain_name,from_email,status,health_score").in("status", ["warming", "warm"]).order("created_at", { ascending: false }).limit(10),
             serverSupabase.from("marketing_automation_rules").select("campaign_id,enabled,delay_minutes").eq("event_key", "lead_created").maybeSingle(),
             serverSupabase.from("marketing_event_log").select("event_key,status,campaign_id,created_at,error_message").eq("event_key", "lead_created").order("created_at", { ascending: false }).limit(1).maybeSingle(),
             serverSupabase.from("email_queue").select("id,status,scheduled_at,created_at,campaign_id").order("created_at", { ascending: false }).limit(1).maybeSingle(),
+            serverSupabase.from("contacts").select("company_name,job_title,website,personalization,custom_subject,custom_body,custom_followup_1,custom_followup_2").limit(1),
+            serverSupabase.from("campaigns").select("followup_email_enabled,followup_delay_days,followup2_email_enabled,followup2_delay_days").limit(1),
+            serverSupabase.from("email_queue").select("personalized_subject,personalized_body,wait_days").limit(1),
+            serverSupabase.from("automation_audits").select("id", { count: "exact", head: true }),
         ]);
 
-        const databaseError = [pages.error, campaigns.error, domains.error, rule.error, recentEvent.error, recentQueue.error].find(Boolean);
+        const schemaError = [contactSchema.error, campaignSchema.error, queueSchema.error, growthSchema.error].find(Boolean);
+        const databaseError = [schemaError, pages.error, campaigns.error, domains.error, rule.error, recentEvent.error, recentQueue.error].find(Boolean);
         const linkedCampaign = rule.data?.campaign_id
             ? campaigns.data?.find((campaign) => campaign.id === rule.data?.campaign_id)
             : null;
@@ -57,6 +62,8 @@ export async function GET(request: NextRequest) {
             },
             checks: {
                 database: !databaseError,
+                excelAutomationSchema: !schemaError,
+                growthEngine: !growthSchema.error,
                 sender: Boolean(process.env.RESEND_API_KEY && domains.data?.length),
                 landingPage: Boolean(pages.data?.length),
                 campaign: Boolean(campaigns.data?.length),

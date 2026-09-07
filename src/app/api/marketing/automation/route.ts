@@ -17,6 +17,10 @@ function safeSlug(value: unknown) {
     return clean(value, 100).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+function safeDesign(value: unknown) {
+    return ["sage", "midnight", "violet", "editorial", "aurora"].includes(value as string) ? value as string : "sage";
+}
+
 async function landingPageResponse(request: NextRequest) {
     const id = request.nextUrl.searchParams.get("id");
     if (id) {
@@ -40,6 +44,7 @@ async function saveLandingPage(body: { action?: string; id?: string; page?: Part
         status,
         seo_title: clean(input.seo_title, 160) || clean(input.name, 160) || "Campaign landing page",
         seo_description: clean(input.seo_description, 320),
+        design_key: safeDesign(input.design_key),
         updated_at: new Date().toISOString(),
         published_at: status === "published" ? new Date().toISOString() : null,
     };

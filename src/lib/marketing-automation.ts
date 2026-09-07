@@ -2,6 +2,12 @@ import { serverSupabase } from "@/lib/server-supabase";
 
 export const marketingEvents = [
     "lead_created",
+    "qualified_lead",
+    "hot_lead",
+    "audit_booked",
+    "proposal_sent",
+    "pilot_paid",
+    "customer_won",
     "trial_started",
     "integration_connected",
     "model_generated",
@@ -44,6 +50,12 @@ export type MarketingEventInput = {
 
 const stages: Partial<Record<MarketingEventName, string>> = {
     lead_created: "new",
+    qualified_lead: "qualified",
+    hot_lead: "qualified",
+    audit_booked: "qualified",
+    proposal_sent: "qualified",
+    pilot_paid: "customer",
+    customer_won: "customer",
     trial_started: "trial",
     demo_booked: "qualified",
     email_clicked: "contacted",
@@ -59,8 +71,28 @@ const stages: Partial<Record<MarketingEventName, string>> = {
     churned: "churned",
 };
 
+const pipelineStages: Partial<Record<MarketingEventName, string>> = {
+    lead_created: "new",
+    qualified_lead: "qualified",
+    hot_lead: "qualified",
+    audit_booked: "audit_booked",
+    proposal_sent: "proposal",
+    pilot_paid: "pilot",
+    customer_won: "won",
+    demo_booked: "audit_booked",
+    paid: "won",
+    refunded: "lost",
+    churned: "lost",
+};
+
 const fallbackCampaignEnv: Partial<Record<MarketingEventName, string>> = {
     lead_created: "MARKETING_CAMPAIGN_LEAD_ID",
+    qualified_lead: "MARKETING_CAMPAIGN_LEAD_ID",
+    hot_lead: "MARKETING_CAMPAIGN_LEAD_ID",
+    audit_booked: "MARKETING_CAMPAIGN_DEMO_ID",
+    proposal_sent: "MARKETING_CAMPAIGN_DEMO_ID",
+    pilot_paid: "MARKETING_CAMPAIGN_PAID_ID",
+    customer_won: "MARKETING_CAMPAIGN_PAID_ID",
     trial_started: "MARKETING_CAMPAIGN_TRIAL_ID",
     integration_connected: "MARKETING_CAMPAIGN_ONBOARDING_ID",
     model_generated: "MARKETING_CAMPAIGN_ACTIVATION_ID",
@@ -95,7 +127,14 @@ async function resolveRule(event: MarketingEventName, explicitCampaignId?: strin
         .maybeSingle();
 
     if (!error && data) {
-        return { campaignId: data.campaign_id as string | null, enabled: Boolean(data.enabled), delayMinutes: Number(data.delay_minutes ?? 2), stopEvents: Array.isArray(data.stop_events) ? data.stop_events : [] };
+        const campaignId = data.campaign_id as string | null;
+        // Qualification tiers use the standard new-lead campaign until a more
+        // specific campaign is selected in Automation.
+        if (!campaignId && ["qualified_lead", "hot_lead"].includes(event)) {
+            const { data: leadRule } = await serverSupabase.from("marketing_automation_rules").select("campaign_id,enabled,delay_minutes,stop_events").eq("event_key", "lead_created").maybeSingle();
+            if (leadRule?.enabled && leadRule.campaign_id) return { campaignId: leadRule.campaign_id as string, enabled: true, delayMinutes: Number(leadRule.delay_minutes ?? data.delay_minutes ?? 2), stopEvents: Array.isArray(data.stop_events) ? data.stop_events : [] };
+        }
+        return { campaignId, enabled: Boolean(data.enabled), delayMinutes: Number(data.delay_minutes ?? 2), stopEvents: Array.isArray(data.stop_events) ? data.stop_events : [] };
     }
 
     const envName = fallbackCampaignEnv[event];
@@ -134,6 +173,7 @@ export async function processMarketingEvent(input: MarketingEventInput) {
         const existing = existingRows?.[0];
         const currentTags: string[] = Array.isArray(existing?.tags) ? existing.tags : [];
         const stage = stages[input.event];
+        const pipelineStage = pipelineStages[input.event];
         const tags = Array.from(new Set([
             ...currentTags.filter(tag => !stage || !tag.toLowerCase().startsWith("stage:")),
             "marketing-lead",
@@ -151,6 +191,7 @@ export async function processMarketingEvent(input: MarketingEventInput) {
             source,
             last_event: input.event,
             last_event_at: timestamp,
+            ...(pipelineStage ? { pipeline_stage: pipelineStage } : {}),
             ...(input.meta_lead_id ? { meta_lead_id: input.meta_lead_id } : {}),
             ...(input.stripe_customer_id ? { stripe_customer_id: input.stripe_customer_id } : {}),
             ...(input.stripe_subscription_id ? { stripe_subscription_id: input.stripe_subscription_id } : {}),

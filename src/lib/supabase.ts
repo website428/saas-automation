@@ -43,6 +43,8 @@ export interface Contact {
   personalization: string | null;
   custom_subject: string | null;
   custom_body: string | null;
+  custom_followup_1: string | null;
+  custom_followup_2: string | null;
   tags: string[];
   status: 'pending' | 'sent' | 'bounced' | 'unsubscribed';
   created_at: string;
@@ -81,6 +83,7 @@ export interface EmailQueue {
   contact_id: string;
   domain_id: string;
   sequence_step: number;
+  wait_days: number;
   scheduled_at: string;
   status: 'queued' | 'sending' | 'sent' | 'failed' | 'cancelled';
   attempts: number;

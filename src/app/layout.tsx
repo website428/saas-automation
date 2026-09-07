@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ColdReach — Smart Cold Email Platform",
-  description: "Domain warmup and cold email delivery platform with intelligent scheduling",
+  title: "Finasoft Sales — Growth Automation Platform",
+  description: "Lead qualification, lifecycle email automation and sales pipeline for Finasoft Ventures.",
 };
 
 export default function RootLayout({

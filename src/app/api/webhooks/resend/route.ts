@@ -113,6 +113,13 @@ export async function POST(req: NextRequest) {
                     await supabase.from('contacts')
                         .update({ status: 'bounced' })
                         .eq('id', queueItem.contact_id);
+                    await supabase.from('email_queue').update({
+                        status: 'cancelled',
+                        error_message: 'Follow-up stopped: previous email bounced',
+                    }).eq('contact_id', queueItem.contact_id)
+                      .eq('domain_id', queueItem.domain_id)
+                      .eq('status', 'queued')
+                      .gt('sequence_step', 1);
                     await supabase.rpc('increment_campaign_bounced', { cid: queueItem.campaign_id });
 
                     // ⭐ Auto-Pause Logic (Subdomain Protection)
@@ -153,6 +160,13 @@ export async function POST(req: NextRequest) {
                 await supabase.from('domains')
                     .update({ status: 'paused', health_score: 0 })
                     .eq('id', queueItem.domain_id);
+                await supabase.from('email_queue').update({
+                    status: 'cancelled',
+                    error_message: 'Follow-up stopped: spam complaint',
+                }).eq('contact_id', queueItem.contact_id)
+                  .eq('domain_id', queueItem.domain_id)
+                  .eq('status', 'queued')
+                  .gt('sequence_step', 1);
                 break;
         }
 
