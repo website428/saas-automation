@@ -76,9 +76,9 @@ async function saveLandingPage(body: { action?: string; id?: string; page?: Part
 }
 
 export async function GET(request: NextRequest) {
+    if (request.nextUrl.searchParams.get("resource") === "landing-pages") return landingPageResponse(request);
     if (!process.env.MARKETING_WEBHOOK_SECRET && !process.env.LANDING_PAGE_ADMIN_SECRET) return NextResponse.json({ error: "MARKETING_WEBHOOK_SECRET or LANDING_PAGE_ADMIN_SECRET is not configured." }, { status: 503 });
     if (!authorized(request)) return NextResponse.json({ error: "Invalid automation admin secret." }, { status: 401 });
-    if (request.nextUrl.searchParams.get("resource") === "landing-pages") return landingPageResponse(request);
     const [rulesResult, campaignsResult] = await Promise.all([
         serverSupabase.from("marketing_automation_rules").select("id,event_key,campaign_id,enabled,delay_minutes,stop_events,updated_at").order("event_key"),
         serverSupabase.from("campaigns").select("id,name,status").in("status", ["active", "draft"]).order("created_at", { ascending: false }),
@@ -87,8 +87,6 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-    if (!process.env.MARKETING_WEBHOOK_SECRET && !process.env.LANDING_PAGE_ADMIN_SECRET) return NextResponse.json({ error: "MARKETING_WEBHOOK_SECRET or LANDING_PAGE_ADMIN_SECRET is not configured." }, { status: 503 });
-    if (!authorized(request)) return NextResponse.json({ error: "Invalid automation admin secret." }, { status: 401 });
     let body: any;
     try { body = await request.json(); } catch { return NextResponse.json({ error: "Request body must be valid JSON." }, { status: 400 }); }
     if (body.resource === "landing-pages") {
@@ -105,6 +103,8 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: /duplicate|unique/i.test(message) ? "That slug is already used. Choose another." : message }, { status: 400 });
         }
     }
+    if (!process.env.MARKETING_WEBHOOK_SECRET && !process.env.LANDING_PAGE_ADMIN_SECRET) return NextResponse.json({ error: "MARKETING_WEBHOOK_SECRET or LANDING_PAGE_ADMIN_SECRET is not configured." }, { status: 503 });
+    if (!authorized(request)) return NextResponse.json({ error: "Invalid automation admin secret." }, { status: 401 });
     if (!marketingEvents.includes(body.event_key)) return NextResponse.json({ error: "Unsupported automation event." }, { status: 400 });
     const delayMinutes = Math.max(0, Math.min(43200, Number(body.delay_minutes ?? 2)));
     const { data, error } = await serverSupabase.from("marketing_automation_rules").upsert({ event_key: body.event_key, campaign_id: body.campaign_id || null, enabled: body.enabled !== false, delay_minutes: delayMinutes, stop_events: Array.isArray(body.stop_events) ? body.stop_events.filter((event: unknown) => typeof event === "string") : [], updated_at: new Date().toISOString() }, { onConflict: "event_key" }).select("id,event_key,campaign_id,enabled,delay_minutes,stop_events,updated_at").single();

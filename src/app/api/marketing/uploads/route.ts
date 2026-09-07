@@ -1,18 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { serverSupabase } from "@/lib/server-supabase";
 
-function authorized(request: NextRequest) {
-    const secrets = [process.env.LANDING_PAGE_ADMIN_SECRET, process.env.MARKETING_WEBHOOK_SECRET].filter(Boolean);
-    const bearer = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-    return secrets.length > 0 && secrets.some(secret => request.headers.get("x-marketing-secret") === secret || bearer === secret);
-}
-
 function safeFileName(value: string) {
     return value.toLowerCase().replace(/[^a-z0-9.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "asset";
 }
 
 export async function POST(request: NextRequest) {
-    if (!authorized(request)) return NextResponse.json({ error: "Invalid automation admin secret." }, { status: 401 });
     try {
         const formData = await request.formData();
         const file = formData.get("file");

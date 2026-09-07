@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { ChevronDown, ChevronUp, Eye, Globe2, Plus, Save, Trash2, X, Copy } from "lucide-react";
 import { Theme, useTheme } from "@/components/theme-provider";
@@ -21,17 +21,16 @@ function itemFields(sectionType: LandingSectionType, items: Array<Record<string,
     return Object.keys(items[0] || { title: "", body: "" });
 }
 
-function AssetField({ value, onChange, field, secret, t }: { value: string; onChange: (value: string) => void; field: string; secret: string; t: Theme }) {
+function AssetField({ value, onChange, field, t }: { value: string; onChange: (value: string) => void; field: string; t: Theme }) {
     const [uploading, setUploading] = useState(false);
     const [error, setError] = useState("");
     async function upload(file: File | undefined) {
         if (!file) return;
-        if (!secret.trim()) { setError("Enter the admin secret above first."); return; }
         setUploading(true); setError("");
         try {
             const formData = new FormData();
             formData.append("file", file);
-            const response = await fetch("/api/marketing/uploads", { method: "POST", headers: { "x-marketing-secret": secret.trim() }, body: formData });
+            const response = await fetch("/api/marketing/uploads", { method: "POST", body: formData });
             const body = await response.json();
             if (!response.ok) setError(body.error || "Upload failed.");
             else onChange(body.url);
@@ -44,7 +43,7 @@ function AssetField({ value, onChange, field, secret, t }: { value: string; onCh
     return <div style={{ display: "grid", gap: 5, marginTop: 4 }}><div style={{ display: "flex", gap: 7, alignItems: "center" }}><input type="url" value={value} onChange={(event) => onChange(event.target.value)} placeholder={field === "avatar_url" ? "Optional avatar image URL" : "Paste an image URL or upload below"} style={{ ...inputStyle(t), marginTop: 0 }} /><label style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5, border: `1px solid ${t.border}`, borderRadius: 8, background: t.card, color: t.textSec, padding: "9px 10px", cursor: uploading ? "wait" : "pointer", fontSize: 10, fontWeight: 700 }}>{uploading ? "Uploading…" : "Upload"}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={uploading} onChange={(event) => { void upload(event.target.files?.[0]); event.currentTarget.value = ""; }} style={{ display: "none" }} /></label></div>{error && <span style={{ color: t.coral, fontSize: 10 }}>{error}</span>}{value && <img src={value} alt="Uploaded asset preview" style={{ width: field === "avatar_url" ? 54 : "100%", maxWidth: field === "avatar_url" ? 54 : 420, height: field === "avatar_url" ? 54 : 150, objectFit: "cover", borderRadius: 8, border: `1px solid ${t.border}` }} />}</div>;
 }
 
-function ListEditor({ sectionType, value, onChange, t, secret }: { sectionType: LandingSectionType; value: unknown; onChange: (value: Array<Record<string, string>>) => void; t: Theme; secret: string }) {
+function ListEditor({ sectionType, value, onChange, t }: { sectionType: LandingSectionType; value: unknown; onChange: (value: Array<Record<string, string>>) => void; t: Theme }) {
     const items = Array.isArray(value) ? value.map((item) => item && typeof item === "object" ? item as Record<string, unknown> : {}) : [];
     const fields = itemFields(sectionType, items);
     const updateItem = (itemIndex: number, field: string, nextValue: string) => onChange(items.map((item, index) => index === itemIndex ? { ...Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, String(entry ?? "")])), [field]: nextValue } : Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, String(entry ?? "")]))));
@@ -52,7 +51,7 @@ function ListEditor({ sectionType, value, onChange, t, secret }: { sectionType: 
     return <div style={{ display: "grid", gap: 9, marginTop: 6 }}>
         {items.map((item, itemIndex) => <div key={itemIndex} style={{ padding: 11, borderRadius: 9, border: `1px solid ${t.border}`, background: t.cardInner }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}><strong style={{ color: t.text, fontSize: 11 }}>Item {itemIndex + 1}</strong><button type="button" onClick={() => onChange(items.filter((_, index) => index !== itemIndex).map((entry) => Object.fromEntries(Object.entries(entry).map(([key, itemValue]) => [key, String(itemValue ?? "")]))))} style={{ border: 0, background: "transparent", color: t.coral, cursor: "pointer" }}>Remove</button></div>
-            <div style={{ display: "grid", gap: 8 }}>{fields.map((field) => <label key={field} style={{ color: t.textSec, fontSize: 10 }}>{sectionKeyLabel(field)}{(field === "image_url" || field === "avatar_url") ? <AssetField value={String(item[field] ?? "")} onChange={(nextValue) => updateItem(itemIndex, field, nextValue)} field={field} secret={secret} t={t} /> : <textarea value={String(item[field] ?? "")} onChange={(event) => updateItem(itemIndex, field, event.target.value)} rows={field === "name" || field === "title" || field === "question" ? 1 : 2} style={{ ...inputStyle(t), marginTop: 4, resize: "vertical" }} />}</label>)}</div>
+            <div style={{ display: "grid", gap: 8 }}>{fields.map((field) => <label key={field} style={{ color: t.textSec, fontSize: 10 }}>{sectionKeyLabel(field)}{(field === "image_url" || field === "avatar_url") ? <AssetField value={String(item[field] ?? "")} onChange={(nextValue) => updateItem(itemIndex, field, nextValue)} field={field} t={t} /> : <textarea value={String(item[field] ?? "")} onChange={(event) => updateItem(itemIndex, field, event.target.value)} rows={field === "name" || field === "title" || field === "question" ? 1 : 2} style={{ ...inputStyle(t), marginTop: 4, resize: "vertical" }} />}</label>)}</div>
         </div>)}
         <button type="button" onClick={addItem} style={{ justifySelf: "start", display: "inline-flex", alignItems: "center", gap: 5, border: `1px dashed ${t.accentBorder}`, borderRadius: 8, background: t.accentSoft, color: t.accent, padding: "8px 10px", cursor: "pointer", fontSize: 11, fontWeight: 700 }}><Plus size={13} /> Add item</button>
     </div>;
@@ -64,7 +63,6 @@ function sectionKeyLabel(key: string) {
 
 export default function LandingPagesBuilder() {
     const { theme: t } = useTheme();
-    const [secret, setSecret] = useState("");
     const [pages, setPages] = useState<Array<Pick<LandingPage, "id" | "name" | "slug" | "status" | "updated_at">>>([]);
     const [page, setPage] = useState<LandingPage | null>(null);
     const [message, setMessage] = useState("");
@@ -73,20 +71,11 @@ export default function LandingPagesBuilder() {
     const [showTemplates, setShowTemplates] = useState(false);
     const [publishedUrl, setPublishedUrl] = useState("");
 
-    const headers = () => ({ "content-type": "application/json", "x-marketing-secret": secret.trim() });
+    const headers = () => ({ "content-type": "application/json" });
 
-    useEffect(() => {
-        const savedSecret = sessionStorage.getItem("finmodel_admin_secret") || "";
-        if (savedSecret) { setSecret(savedSecret); void loadPages(savedSecret); }
-    // The saved secret is intentionally loaded once for this browser session.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    async function loadPages(secretValue = secret) {
-        if (!secretValue.trim()) return setMessage("Enter LANDING_PAGE_ADMIN_SECRET first.");
-        sessionStorage.setItem("finmodel_admin_secret", secretValue.trim());
+    async function loadPages() {
         setLoading(true); setMessage("");
-        const response = await fetch("/api/marketing/automation?resource=landing-pages", { headers: { "x-marketing-secret": secretValue.trim() } });
+        const response = await fetch("/api/marketing/automation?resource=landing-pages");
         const body = await response.json();
         if (!response.ok) setMessage(body.error || "Could not load landing pages.");
         else setPages(body.pages || []);
@@ -94,7 +83,7 @@ export default function LandingPagesBuilder() {
     }
 
     async function openPage(id: string) {
-        const response = await fetch(`/api/marketing/automation?resource=landing-pages&id=${id}`, { headers: { "x-marketing-secret": secret.trim() } });
+        const response = await fetch(`/api/marketing/automation?resource=landing-pages&id=${id}`);
         const body = await response.json();
         if (response.ok) setPage(body.page);
         else setMessage(body.error || "Could not open landing page.");
@@ -162,11 +151,10 @@ export default function LandingPagesBuilder() {
 
     async function save(status?: LandingPage["status"]) {
         if (!page) return;
-        if (!secret.trim()) return setMessage("Enter the admin secret first.");
         setSaving(true); setMessage("");
         try {
             const nextPage = { ...page, status: status || page.status };
-            const response = await fetch("/api/marketing/automation", { method: "POST", headers: headers(), body: JSON.stringify({ resource: "landing-pages", action: "save", id: page.id, page: nextPage }) });
+            const response = await fetch("/api/marketing/automation", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ resource: "landing-pages", action: "save", id: page.id, page: nextPage }) });
             const body = await response.json();
             if (!response.ok) setMessage(body.error || "Could not save landing page.");
             else { setPage(body.page); const publicPath = `/p/${body.page.slug}`; setPublishedUrl(status === "published" ? publicPath : ""); setMessage(status === "published" ? "Published successfully. Open the public page below to test it." : "Saved."); await loadPages(); }
@@ -189,7 +177,7 @@ export default function LandingPagesBuilder() {
         <style>{`@media(max-width:800px){.landing-builder-grid{grid-template-columns:1fr!important}.landing-settings-grid{grid-template-columns:1fr!important}}@media(max-width:520px){.landing-template-grid{grid-template-columns:1fr!important}}`}</style>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 14, flexWrap: "wrap" }}>
             <div><h1 style={{ margin: 0, color: t.text, fontSize: 26, letterSpacing: "-0.03em" }}>Landing page builder</h1><p style={{ margin: "7px 0 0", color: t.textMuted, fontSize: 14 }}>Create campaign pages without changing your product website.</p></div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}><input type="password" value={secret} onChange={event => setSecret(event.target.value)} placeholder="Admin secret" style={{ ...inputStyle(t), width: 190 }} /><button onClick={() => loadPages()} disabled={loading} style={{ padding: "9px 12px", border: 0, borderRadius: 8, background: t.accent, color: "#fff", fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{loading ? "Loading…" : "Load pages"}</button></div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}><button onClick={() => loadPages()} disabled={loading} style={{ padding: "9px 12px", border: 0, borderRadius: 8, background: t.accent, color: "#fff", fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{loading ? "Loading…" : "Refresh pages"}</button></div>
         </div>
         {message && <div style={{ padding: 12, borderRadius: 9, background: t.cardInner, color: t.textSec, fontSize: 12 }}>{message}</div>}
         {publishedUrl && <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", padding: 12, borderRadius: 9, border: `1px solid ${t.accentBorder}`, background: t.accentSoft }}><div><strong style={{ display: "block", color: t.text, fontSize: 12 }}>Your page is live</strong><span style={{ display: "block", marginTop: 4, color: t.textSec, fontSize: 11 }}>{publishedUrl}</span></div><Link href={publishedUrl} target="_blank" style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 11px", borderRadius: 8, background: t.accent, color: "#fff", textDecoration: "none", fontSize: 11, fontWeight: 700 }}><Eye size={13} /> Open page</Link></div>}
@@ -205,7 +193,7 @@ export default function LandingPagesBuilder() {
                         <div><span style={{ display: "block", color: t.textMuted, fontSize: 9, fontWeight: 800, letterSpacing: ".08em", textTransform: "uppercase", marginBottom: 5 }}>Section {index + 1}</span><select value={section.section_type} onChange={event => changeSectionType(index, event.target.value as LandingSectionType)} style={{ ...inputStyle(t), width: 180, fontWeight: 700 }}>{sectionTypes.map(type => <option key={type} value={type}>{sectionLabels[type]}</option>)}</select></div>
                         <div style={{ display: "flex", gap: 4 }}><button onClick={() => moveSection(index, -1)} disabled={index === 0} title="Move section up" style={{ border: 0, background: t.cardInner, color: t.textSec, borderRadius: 7, padding: 6, cursor: "pointer", opacity: index === 0 ? .35 : 1 }}><ChevronUp size={15} /></button><button onClick={() => moveSection(index, 1)} disabled={index === page.sections.length - 1} title="Move section down" style={{ border: 0, background: t.cardInner, color: t.textSec, borderRadius: 7, padding: 6, cursor: "pointer", opacity: index === page.sections.length - 1 ? .35 : 1 }}><ChevronDown size={15} /></button><button onClick={() => removeSection(index)} title="Remove section" style={{ border: 0, background: "transparent", color: t.coral, cursor: "pointer", padding: 6 }}><Trash2 size={15} /></button></div>
                     </div>
-                    <div style={{ display: "grid", gap: 10 }}>{Object.entries(section.content).map(([key, value]) => <label key={key} style={{ color: t.textSec, fontSize: 11 }}>{sectionKeyLabel(key)}{Array.isArray(value) ? <ListEditor sectionType={section.section_type} value={value} onChange={(items) => updateContent(index, key, items)} t={t} secret={secret} /> : <textarea value={String(value ?? "")} onChange={event => updateContent(index, key, event.target.value)} rows={String(value).length > 90 ? 4 : 2} style={{ ...inputStyle(t), marginTop: 5, resize: "vertical" }} />}</label>)}</div>
+                    <div style={{ display: "grid", gap: 10 }}>{Object.entries(section.content).map(([key, value]) => <label key={key} style={{ color: t.textSec, fontSize: 11 }}>{sectionKeyLabel(key)}{Array.isArray(value) ? <ListEditor sectionType={section.section_type} value={value} onChange={(items) => updateContent(index, key, items)} t={t} /> : <textarea value={String(value ?? "")} onChange={event => updateContent(index, key, event.target.value)} rows={String(value).length > 90 ? 4 : 2} style={{ ...inputStyle(t), marginTop: 5, resize: "vertical" }} />}</label>)}</div>
                 </div>)}
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}><button onClick={addSection} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 12px", borderRadius: 8, border: `1px solid ${t.border}`, background: t.card, color: t.textSec, fontSize: 11, fontWeight: 700, cursor: "pointer" }}><Plus style={{ width: 13, height: 13 }} /> Add section</button><div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{page.id && <button onClick={duplicatePage} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 12px", borderRadius: 8, border: `1px solid ${t.border}`, background: t.card, color: t.textSec, fontSize: 11, fontWeight: 700, cursor: "pointer" }}><Copy style={{ width: 13, height: 13 }} /> Duplicate</button>}{page.id && page.status === "published" && <Link href={`/?page=${page.slug}`} target="_blank" style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 12px", borderRadius: 8, border: `1px solid ${t.border}`, background: t.card, color: t.textSec, fontSize: 11, fontWeight: 700, textDecoration: "none" }}><Eye style={{ width: 13, height: 13 }} /> Preview</Link>}{page.id && <button onClick={removePage} style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${t.coral}`, background: "transparent", color: t.coral, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Delete</button>}<button onClick={() => save("draft")} disabled={saving} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 12px", borderRadius: 8, border: `1px solid ${t.border}`, background: t.card, color: t.textSec, fontSize: 11, fontWeight: 700, cursor: "pointer" }}><Save style={{ width: 13, height: 13 }} /> Save draft</button><button onClick={() => save("published")} disabled={saving} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 13px", borderRadius: 8, border: 0, background: t.accent, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}><Globe2 style={{ width: 13, height: 13 }} /> Publish</button></div></div>
             </div>}
