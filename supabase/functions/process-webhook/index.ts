@@ -55,6 +55,14 @@ Deno.serve(async (req) => {
             metadata: data,
         });
 
+        // Preserve the RFC Message-ID supplied by Resend's email.sent event.
+        // Later inbound replies reference this exact header in In-Reply-To.
+        if (queueItem && eventType === 'email.sent' && data?.message_id) {
+            await supabase.from('email_queue').update({
+                outbound_message_id: normalizeMessageId(data.message_id),
+            }).eq('id', queueItem.id);
+        }
+
         // ── Granular status mapping ──────────────────────────────
         // Each event updates the email_queue row to its latest status
         const statusMap: Record<string, string> = {
@@ -96,7 +104,8 @@ Deno.serve(async (req) => {
 
             // Campaign counter increments
             if (newStatus === 'delivered') {
-                await supabase.rpc('increment_campaign_sent', { cid: queueItem.campaign_id });
+                // The sending worker increments sent_count when Resend accepts the
+                // message. Counting delivery again inflated campaign totals.
                 await updateDomainHealth(queueItem.domain_id);
             }
             if (newStatus === 'opened') {
@@ -306,4 +315,10 @@ async function updateDomainHealth(domainId: string) {
         health_score: healthScore,
         ...(total >= 25 && bounceRate >= 0.02 ? { status: 'paused' } : {}),
     }).eq('id', domainId);
+}
+
+function normalizeMessageId(input: unknown): string | null {
+    const value = String(input || '').trim();
+    const match = value.match(/<[^<>]+>/);
+    return match ? match[0] : null;
 }

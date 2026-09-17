@@ -32,7 +32,9 @@ Deno.serve(async (req) => {
         // Resend email.received webhook structure:
         // { type: 'email.received', data: { email_id, from, to, subject, message_id, ... } }
         // NOTE: body text is NOT included in the webhook — must call GET /emails/receiving/{id}
-        const webhookSecret = Deno.env.get('RESEND_WEBHOOK_SECRET');
+        const inboundWebhookSecret = Deno.env.get('RESEND_INBOUND_WEBHOOK_SECRET')?.trim();
+        const outboundWebhookSecret = Deno.env.get('RESEND_WEBHOOK_SECRET')?.trim();
+        const webhookSecret = inboundWebhookSecret || outboundWebhookSecret;
         if (!webhookSecret) return new Response(JSON.stringify({ error: 'Webhook secret not configured' }), { status: 500 });
         const rawBody = await req.text();
         const headers: Record<string, string> = {};
@@ -41,10 +43,28 @@ Deno.serve(async (req) => {
         try {
             outer = new Webhook(webhookSecret).verify(rawBody, headers);
         } catch {
+            console.warn('[resend-inbound] Invalid Resend signature; using', inboundWebhookSecret ? 'RESEND_INBOUND_WEBHOOK_SECRET' : 'RESEND_WEBHOOK_SECRET fallback');
             return new Response(JSON.stringify({ error: 'Invalid signature' }), { status: 401 });
         }
         await supabase.rpc('record_resend_inbound_usage');
         const data = outer?.data ?? outer; // handle both nested and flat payloads
+
+        // Optional clean-start guard. Set INBOX_RESET_AT to an ISO timestamp
+        // immediately before clearing the Inbox. Resend retries created before
+        // that timestamp are acknowledged but not written back into the Inbox.
+        const resetAt = Deno.env.get('INBOX_RESET_AT');
+        const eventCreatedAt = outer?.created_at || data?.created_at;
+        if (resetAt && eventCreatedAt) {
+            const resetTime = Date.parse(resetAt);
+            const eventTime = Date.parse(eventCreatedAt);
+            if (Number.isFinite(resetTime) && Number.isFinite(eventTime) && eventTime < resetTime) {
+                console.log(`[resend-inbound] Ignoring pre-reset event ${eventCreatedAt}`);
+                return new Response(
+                    JSON.stringify({ received: true, ignored: 'before inbox reset' }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+        }
 
         // Debug: log full payload keys
         console.log('[resend-inbound] Raw payload type:', outer?.type, '| data keys:', Object.keys(data).join(', '));
@@ -56,6 +76,9 @@ Deno.serve(async (req) => {
             : extractEmail(data.to ?? '');
         const subject: string = data.subject || '(no subject)';
         const emailId: string = data.email_id || data.id || '';
+        // RFC Message-ID from the sender's email client. Keeping this lets the
+        // portal's send-reply function reply in the same external email thread.
+        const inboundMessageId = normalizeMessageId(data.message_id || '');
 
         console.log(`[resend-inbound] from=${fromEmail} to=${toEmail} subject="${subject}" email_id=${emailId}`);
 
@@ -68,6 +91,7 @@ Deno.serve(async (req) => {
         // We MUST call GET /emails/receiving/{email_id} to retrieve text/html.
         let body = '';
         let inReplyTo: string | null = null;
+        let inReplyToMessageId: string | null = null;
 
         // Step 1: Try inline fields (future-proofing — Resend may add these)
         if (data.text) {
@@ -87,14 +111,18 @@ Deno.serve(async (req) => {
             data.inReplyTo ||
             '';
         if (inReplyToRawInline) {
-            inReplyTo = inReplyToRawInline.replace(/[<>\s]/g, '').split('@')[0].trim() || null;
+            inReplyToMessageId = normalizeMessageId(inReplyToRawInline);
+            const uuidMatch = inReplyToRawInline.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+            inReplyTo = uuidMatch ? uuidMatch[0] : null;
         }
 
         // Step 2: Fetch full email from Resend Receiving API
         // Correct endpoint: GET /emails/receiving/{email_id} (NOT /emails/{id})
         // This returns: html, text, headers (including In-Reply-To), message_id
         if (emailId) {
-            const resendApiKey = Deno.env.get('RESEND_API_KEY') || '';
+            // Keep outbound sending and inbound reading scoped separately. A
+            // sending_access key cannot call /emails/receiving/{id}.
+            const resendApiKey = Deno.env.get('RESEND_RECEIVING_API_KEY') || Deno.env.get('RESEND_API_KEY') || '';
             if (resendApiKey) {
                 try {
                     const url = `https://api.resend.com/emails/receiving/${emailId}`;
@@ -116,8 +144,12 @@ Deno.serve(async (req) => {
                             apiHeaders['in-reply-to'] ||
                             apiHeaders['In-Reply-To'] ||
                             '';
+                        if (inReplyToRawApi) {
+                            inReplyToMessageId = inReplyToMessageId || normalizeMessageId(inReplyToRawApi);
+                        }
                         if (!inReplyTo && inReplyToRawApi) {
-                            inReplyTo = inReplyToRawApi.replace(/[<>\s]/g, '').split('@')[0].trim() || null;
+                            const uuidMatch = inReplyToRawApi.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+                            inReplyTo = uuidMatch ? uuidMatch[0] : null;
                             console.log('[resend-inbound] In-Reply-To from API headers:', inReplyTo);
                         }
                     }
@@ -155,14 +187,25 @@ Deno.serve(async (req) => {
         // ── 2. Find the latest queue item (3-tier fallback) ────────────
         let queueItem: any = null;
 
-        // Tier 1: Match by In-Reply-To (most precise)
+        // Tier 1: RFC Message-ID matching (most precise)
+        if (inReplyToMessageId) {
+            const { data: q } = await supabase
+                .from('email_queue')
+                .select('id, campaign_id, contact_id, domain_id')
+                .eq('outbound_message_id', inReplyToMessageId)
+                .maybeSingle();
+            queueItem = q;
+            if (queueItem) console.log('[resend-inbound] Matched by outbound RFC Message-ID');
+        }
+
+        // Legacy fallback for older queue rows.
         if (inReplyTo) {
             const { data: q } = await supabase
                 .from('email_queue')
                 .select('id, campaign_id, contact_id, domain_id')
                 .eq('resend_id', inReplyTo)
                 .maybeSingle();
-            queueItem = q;
+            queueItem = queueItem || q;
             if (queueItem) console.log('[resend-inbound] Matched by In-Reply-To');
         }
 
@@ -194,63 +237,18 @@ Deno.serve(async (req) => {
             if (queueItem) console.log('[resend-inbound] Matched by email join');
         }
 
-        // ── Unmatched reply fallback — still save to inbox ─────────────
+        // ── Ignore unrelated inbound mail ──────────────────────────────
         if (!queueItem) {
-            console.warn('[resend-inbound] No queue match for:', fromEmail, '— saving as unmatched');
-
-            const toDomain = toEmail.split('@')[1] || '';
-            const { data: domain } = await supabase
-                .from('domains')
-                .select('id')
-                .ilike('domain_name', `%${toDomain}%`)
-                .limit(1)
-                .maybeSingle();
-
-            if (!domain) {
-                return new Response(JSON.stringify({ received: true, matched: false, reason: 'no domain' }), { status: 200 });
-            }
-
-            let contactId: string | null = contact?.id || null;
-            if (!contactId) {
-                const { data: nc } = await supabase
-                    .from('contacts')
-                    .insert({ email: fromEmail, name: fromEmail.split('@')[0], status: 'pending' })
-                    .select('id').single();
-                contactId = nc?.id || null;
-            }
-            if (!contactId) {
-                return new Response(JSON.stringify({ received: true, matched: false, reason: 'no contact' }), { status: 200 });
-            }
-
-            const { data: exT } = await supabase
-                .from('inbox_threads')
-                .select('id, message_count')
-                .eq('contact_id', contactId)
-                .eq('domain_id', domain.id)
-                .maybeSingle();
-
-            let unThreadId: string;
-            if (exT) {
-                await supabase.from('inbox_threads').update({
-                    last_message: body.substring(0, 200), last_at: new Date().toISOString(),
-                    is_read: false, message_count: exT.message_count + 1,
-                }).eq('id', exT.id);
-                unThreadId = exT.id;
-            } else {
-                const { data: nt, error: ntErr } = await supabase.from('inbox_threads')
-                    .insert({ contact_id: contactId, domain_id: domain.id, campaign_id: null, queue_id: null,
-                        subject, last_message: body.substring(0, 200), last_at: new Date().toISOString(),
-                        is_read: false, message_count: 1 })
-                    .select('id').single();
-                if (ntErr || !nt) {
-                    return new Response(JSON.stringify({ received: true, matched: false, reason: 'thread insert failed' }), { status: 200 });
-                }
-                unThreadId = nt.id;
-            }
-
-            await supabase.from('inbox_messages').insert({ thread_id: unThreadId, direction: 'inbound', body });
-            console.log('[resend-inbound] Unmatched reply saved, thread:', unThreadId);
-            return new Response(JSON.stringify({ received: true, matched: false, threadId: unThreadId }), { status: 200 });
+            console.warn('[resend-inbound] No sent-email match for:', fromEmail, '— ignored');
+            return new Response(JSON.stringify({
+                received: true,
+                matched: false,
+                stored: false,
+                reason: 'not a reply to a tracked sent email',
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
         }
 
         // ── 3. Find or create inbox thread ─────────────────────────────
@@ -341,6 +339,7 @@ Deno.serve(async (req) => {
             thread_id: threadId,
             direction: 'inbound',
             body: body || '(reply received)',
+            resend_id: inboundMessageId || null,
         });
 
         await supabase.from('email_queue').update({
@@ -391,4 +390,11 @@ function extractEmail(input: any): string {
         return input.address || input.email || '';
     }
     return '';
+}
+
+function normalizeMessageId(input: unknown): string {
+    const value = String(input || '').trim();
+    if (!value) return '';
+    const bracketed = value.match(/<[^<>]+>/);
+    return bracketed ? bracketed[0] : value;
 }

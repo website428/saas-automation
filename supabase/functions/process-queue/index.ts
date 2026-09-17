@@ -161,6 +161,32 @@ async function isValidEmail(email: string): Promise<boolean> {
     }
 }
 
+type MxStatus = 'ready' | 'missing' | 'unavailable';
+
+function getReplyToEmail(sendingDomain: string): string {
+    return (Deno.env.get('REPLY_TO_EMAIL') || `reply@${sendingDomain}`).trim();
+}
+
+async function checkReplyMx(email: string): Promise<MxStatus> {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'missing';
+    const domain = email.split('@')[1]?.toLowerCase();
+    if (!domain) return 'missing';
+    try {
+        const response = await fetch(
+            `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`,
+            { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(5000) },
+        );
+        if (!response.ok) return 'unavailable';
+        const data = await response.json();
+        const records = (data.Answer || [])
+            .map((answer: { data?: string }) => answer.data?.trim() || '')
+            .filter((record: string) => record.length > 0 && !/^\d+\s+\.?$/.test(record));
+        return data.Status === 0 && records.length > 0 ? 'ready' : 'missing';
+    } catch {
+        return 'unavailable';
+    }
+}
+
 // ── ROLE-BASED EMAIL FILTER ───────────────────────────────────────────────────
 const ROLE_BASED_PREFIXES = ['info', 'admin', 'support', 'sales', 'contact', 'hello', 'billing', 'webmaster', 'jobs', 'hr', 'marketing', 'team'];
 function isRoleBasedOrRisky(email: string): boolean {
@@ -215,6 +241,19 @@ Deno.serve(async (req: Request) => {
             // ── Domain time window check ───────────────────────────────────────
             if (!isForced && !isInDomainWindow(domain.send_hour_start ?? 9, domain.send_hour_end ?? 20)) {
                 log.window_skipped++;
+                continue;
+            }
+
+            // Fail closed: a successful sales reply must never be directed to a
+            // domain that cannot receive mail (or whose MX cannot be verified).
+            const replyToEmail = getReplyToEmail(domain.domain_name);
+            const replyMx = await checkReplyMx(replyToEmail);
+            if (replyMx !== 'ready') {
+                log.errors.push(
+                    replyMx === 'missing'
+                        ? `Sending blocked for ${domain.domain_name}: Reply-To ${replyToEmail} has no working MX record. Configure REPLY_TO_EMAIL or Resend Receiving.`
+                        : `Sending blocked for ${domain.domain_name}: receiving DNS for ${replyToEmail} could not be verified.`,
+                );
                 continue;
             }
 
@@ -378,7 +417,6 @@ Deno.serve(async (req: Request) => {
                 const finalSubject = personalize(subjectTemplate, contact);
                 const finalBody = personalize(bodyTemplate, contact);
 
-                const inboundAddress = `reply@${domain.domain_name}`;
                 const appBaseUrl = (Deno.env.get('APP_BASE_URL') || Deno.env.get('NEXT_PUBLIC_APP_URL') || '').replace(/\/$/, '');
                 if (!appBaseUrl) {
                     await supabase.from('email_queue').update({
@@ -394,7 +432,7 @@ Deno.serve(async (req: Request) => {
                     from: `${domain.sender_name || domain.domain_name} <${domain.from_email}>`,
                     to: [contact.email],
                     subject: finalSubject,
-                    reply_to: inboundAddress,
+                    reply_to: replyToEmail,
                     tags: [{ name: 'queue_id', value: item.id }],
                     headers: {
                         'List-Unsubscribe': `<${unsubUrl}>`,
@@ -449,6 +487,7 @@ Deno.serve(async (req: Request) => {
                         sent_at: new Date().toISOString(),
                         resend_id: sent?.id,
                         attempts: item.attempts + 1,
+                        error_message: null,
                     }).eq('id', item.id);
 
                     // ── Atomic counters ────────────────────────────────────────
@@ -497,7 +536,8 @@ Deno.serve(async (req: Request) => {
             if ((remaining ?? 0) === 0 && (activeAutomationRules ?? 0) === 0) {
                 const { count: sentCount } = await supabase
                     .from('email_queue').select('id', { count: 'exact', head: true })
-                    .eq('campaign_id', c.id).eq('status', 'sent');
+                    .eq('campaign_id', c.id)
+                    .in('status', ['sent', 'delivered', 'opened', 'clicked', 'bounced', 'complained']);
 
                 await supabase.from('campaigns').update({
                     status: 'completed',

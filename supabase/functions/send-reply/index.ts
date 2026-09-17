@@ -46,33 +46,38 @@ Deno.serve(async (req) => {
         const contact = thread.contacts as any;
         const domain = thread.domains as any;
 
-        // Find the original email's resend_id for threading (In-Reply-To header)
-        let inReplyTo = '';
-        if (thread.queue_id) {
-            const { data: queueRow } = await supabase
-                .from('email_queue')
-                .select('resend_id')
-                .eq('id', thread.queue_id)
-                .maybeSingle();
-            if (queueRow?.resend_id) {
-                inReplyTo = queueRow.resend_id;
-            }
-        }
+        // Reply to the latest received email's RFC Message-ID. The inbound
+        // handler stores it in inbox_messages.resend_id. Resend's API email ID
+        // is not an RFC Message-ID, so never invent "@resend.dev" here.
+        const { data: latestInbound } = await supabase
+            .from('inbox_messages')
+            .select('resend_id')
+            .eq('thread_id', threadId)
+            .eq('direction', 'inbound')
+            .not('resend_id', 'is', null)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+        const inReplyTo = normalizeMessageId(latestInbound?.resend_id || '');
+        const canThreadExternally = inReplyTo.includes('@');
+        const baseSubject = String(thread.subject || '').replace(/^\s*re:\s*/i, '').trim();
 
         // Send via Resend
         const emailPayload: any = {
             from: `${domain?.sender_name || domain?.domain_name} <${domain?.from_email}>`,
             to: [contact?.email],
-            reply_to: `reply@${domain.domain_name}`,
-            subject: `Re: ${thread.subject || ''}`,
+            reply_to: (Deno.env.get('REPLY_TO_EMAIL') || `reply@${domain.domain_name}`).trim(),
+            subject: `Re: ${baseSubject || 'your message'}`,
             text: replyText,
         };
 
-        // Add threading headers if we have the original resend_id
-        if (inReplyTo) {
+        // These standard headers make Gmail, Outlook, and other clients show
+        // the portal reply in the same conversation as the contact's message.
+        if (canThreadExternally) {
             emailPayload.headers = {
-                'In-Reply-To': `<${inReplyTo}@resend.dev>`,
-                'References': `<${inReplyTo}@resend.dev>`,
+                'In-Reply-To': inReplyTo,
+                'References': inReplyTo,
             };
         }
 
@@ -110,7 +115,11 @@ Deno.serve(async (req) => {
             message_count: thread.message_count + 1,
         }).eq('id', threadId);
 
-        return new Response(JSON.stringify({ success: true, resendId: sent?.id }), {
+        return new Response(JSON.stringify({
+            success: true,
+            resendId: sent?.id,
+            threaded: canThreadExternally,
+        }), {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
@@ -122,3 +131,10 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({ error: err.message }), { status: 500 });
     }
 });
+
+function normalizeMessageId(input: unknown): string {
+    const value = String(input || '').trim();
+    if (!value) return '';
+    const bracketed = value.match(/<[^<>]+>/);
+    return bracketed ? bracketed[0] : value;
+}
