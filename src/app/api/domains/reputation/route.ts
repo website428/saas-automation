@@ -29,6 +29,12 @@ type PortalDomain = {
     bounce_rate: number;
 };
 
+type MxCheck = {
+    status: "present" | "missing" | "unavailable";
+    records: string[];
+    detail: string;
+};
+
 const SPAMHAUS_CODES: Record<string, string> = {
     "127.0.1.2": "spam domain",
     "127.0.1.4": "phishing domain",
@@ -110,8 +116,25 @@ async function checkDmarc(domain: string) {
     return { status: "missing" as const, policy: null, host: `_dmarc.${domain}` };
 }
 
+async function checkMx(domain: string): Promise<MxCheck> {
+    try {
+        const records = await dns.resolveMx(domain);
+        const formatted = records
+            .sort((a, b) => a.priority - b.priority)
+            .map(record => `${record.exchange}:${record.priority}`);
+        return formatted.length
+            ? { status: "present", records: formatted, detail: "An MX record is published and this address can receive mail at the DNS level." }
+            : { status: "missing", records: [], detail: "No MX record is published, so the default Reply-To address cannot receive replies." };
+    } catch (error) {
+        if (dnsNotFound(error)) {
+            return { status: "missing", records: [], detail: "No MX record is published, so the default Reply-To address cannot receive replies." };
+        }
+        return { status: "unavailable", records: [], detail: "MX lookup was unavailable." };
+    }
+}
+
 async function loadResendDomains(): Promise<ResendDomain[]> {
-    const apiKey = process.env.RESEND_API_KEY;
+    const apiKey = process.env.RESEND_RECEIVING_API_KEY || process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error("RESEND_API_KEY is not configured.");
 
     const listResponse = await fetch("https://api.resend.com/domains", {
@@ -135,7 +158,7 @@ async function loadResendDomains(): Promise<ResendDomain[]> {
 export async function GET() {
     try {
         const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-        const [portalResult, complaintResult, resendDomains] = await Promise.all([
+        const [portalResult, complaintResult] = await Promise.all([
             serverSupabase
                 .from("domains")
                 .select("id,domain_name,from_email,status,health_score,bounce_rate")
@@ -145,8 +168,17 @@ export async function GET() {
                 .select("domain_id")
                 .eq("event", "complained")
                 .gte("created_at", since),
-            loadResendDomains(),
         ]);
+
+        let resendDomains: ResendDomain[] = [];
+        let resendCheckError: string | null = null;
+        try {
+            resendDomains = await loadResendDomains();
+        } catch (error) {
+            // A send-only Resend key cannot read /domains. Keep the public DNS
+            // and portal checks useful instead of failing the entire report.
+            resendCheckError = error instanceof Error ? error.message : "Resend domain lookup failed.";
+        }
 
         if (portalResult.error) throw portalResult.error;
         if (complaintResult.error) throw complaintResult.error;
@@ -167,14 +199,17 @@ export async function GET() {
         const domains = await Promise.all(names.map(async (name) => {
             const portal = portalByName.get(name) || null;
             const resend = resendByName.get(name) || null;
-            const [blacklist, dmarc] = await Promise.all([checkSpamhaus(name), checkDmarc(name)]);
+            const [blacklist, dmarc, mx] = await Promise.all([checkSpamhaus(name), checkDmarc(name), checkMx(name)]);
             const essentialRecords = (resend?.records || []).filter((record) => record.record === "DKIM" || record.record === "SPF");
             const failedEssential = essentialRecords.filter((record) => record.status !== "verified");
             const complaints30d = portal ? complaintCounts.get(portal.id) || 0 : 0;
             const findings: string[] = [];
             let overall: "good" | "warning" | "blocked" = "good";
 
-            if (!resend) {
+            if (resendCheckError) {
+                overall = "warning";
+                findings.push(`Resend domain status could not be read (${resendCheckError}); DNS and portal checks are still shown.`);
+            } else if (!resend) {
                 overall = "blocked";
                 findings.push("This portal sender is not present in Resend.");
             } else if (resend.status === "failed" || failedEssential.length) {
@@ -199,6 +234,14 @@ export async function GET() {
             } else if (dmarc.status === "unavailable") {
                 if (overall === "good") overall = "warning";
                 findings.push("DMARC could not be checked.");
+            }
+
+            if (mx.status === "missing") {
+                overall = "blocked";
+                findings.push("No MX record is published for this sending subdomain; the default reply address cannot receive replies.");
+            } else if (mx.status === "unavailable" && overall === "good") {
+                overall = "warning";
+                findings.push("MX could not be checked, so reply receiving is unknown.");
             }
 
             if (portal?.status === "burned" || Number(portal?.bounce_rate || 0) >= 2 || complaints30d > 0) {
@@ -231,6 +274,7 @@ export async function GET() {
                     records: resend.records || [],
                 } : null,
                 dmarc,
+                mx,
                 blacklist,
                 findings,
             };
@@ -245,7 +289,8 @@ export async function GET() {
                 blocked: domains.filter((domain) => domain.overall === "blocked").length,
             },
             domains,
-            note: "Public blacklist checks do not reveal Gmail or Microsoft reputation. Use Google Postmaster Tools and provider feedback for private reputation data.",
+            resendCheckError,
+            note: "MX presence confirms DNS can route mail, but Resend Receiving/webhook setup must also be enabled. Public blacklist checks do not reveal Gmail or Microsoft reputation; use Google Postmaster Tools and provider feedback for private reputation data.",
         }, { headers: { "Cache-Control": "no-store" } });
     } catch (error) {
         return NextResponse.json({

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useTheme, Theme } from "@/components/theme-provider";
 import { supabase } from "@/lib/supabase";
-import { Plus, Send } from "lucide-react";
+import { Plus, Send, Trash2 } from "lucide-react";
 
 interface Campaign {
     id: string;
@@ -99,6 +99,8 @@ export default function CampaignsPage() {
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
     const [loading, setLoading] = useState(true);
     const [statusFilter, setStatusFilter] = useState<string>('all');
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [deleting, setDeleting] = useState(false);
 
     useEffect(() => {
         async function load() {
@@ -131,6 +133,47 @@ export default function CampaignsPage() {
         c.sent_count > 0 ? ((c.opened_count / c.sent_count) * 100).toFixed(1) : null;
     const bounceRate = (c: Campaign) =>
         c.sent_count > 0 ? ((c.bounced_count / c.sent_count) * 100).toFixed(1) : null;
+
+    const visibleCampaigns = campaigns.filter(c => statusFilter === 'all' || c.status === statusFilter);
+    const allVisibleSelected = visibleCampaigns.length > 0 && visibleCampaigns.every(c => selectedIds.includes(c.id));
+
+    function toggleCampaign(id: string) {
+        setSelectedIds(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
+    }
+
+    function toggleAllVisible() {
+        const visibleIds = visibleCampaigns.map(c => c.id);
+        setSelectedIds(current => allVisibleSelected
+            ? current.filter(id => !visibleIds.includes(id))
+            : [...new Set([...current, ...visibleIds])],
+        );
+    }
+
+    async function deleteSelected() {
+        if (selectedIds.length === 0 || deleting) return;
+
+        const confirmed = window.confirm(
+            `Permanently delete ${selectedIds.length} selected campaign${selectedIds.length === 1 ? '' : 's'}? This also removes their queued emails and delivery history.`,
+        );
+        if (!confirmed) return;
+
+        setDeleting(true);
+        const response = await fetch('/api/campaigns/bulk-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: selectedIds }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            alert(`Could not delete the selected campaigns: ${payload.error || 'Unknown error'}`);
+            setDeleting(false);
+            return;
+        }
+
+        setCampaigns(current => current.filter(campaign => !selectedIds.includes(campaign.id)));
+        setSelectedIds([]);
+        setDeleting(false);
+    }
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '28px', fontFamily: t.font }}>
@@ -179,6 +222,32 @@ export default function CampaignsPage() {
                 })}
             </div>
 
+            {!loading && campaigns.length > 0 && (
+                <div style={{ ...card(t), padding: '12px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '9px', cursor: 'pointer', color: t.textSec, fontSize: '13px', fontWeight: 600 }}>
+                        <input
+                            type="checkbox"
+                            checked={allVisibleSelected}
+                            onChange={toggleAllVisible}
+                            style={{ width: '16px', height: '16px', accentColor: t.accent, cursor: 'pointer' }}
+                        />
+                        Select all shown ({visibleCampaigns.length})
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        {selectedIds.length > 0 && <span style={{ color: t.textMuted, fontSize: '12px' }}>{selectedIds.length} selected</span>}
+                        <button
+                            type="button"
+                            disabled={selectedIds.length === 0 || deleting}
+                            onClick={deleteSelected}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', padding: '8px 12px', borderRadius: '8px', border: `1px solid ${selectedIds.length > 0 ? t.coral : t.border}`, background: 'transparent', color: selectedIds.length > 0 ? t.coral : t.textMuted, cursor: selectedIds.length > 0 && !deleting ? 'pointer' : 'not-allowed', fontSize: '12px', fontWeight: 700, opacity: deleting ? 0.65 : 1 }}
+                        >
+                            <Trash2 style={{ width: '14px', height: '14px' }} />
+                            {deleting ? 'Deleting…' : 'Delete selected'}
+                        </button>
+                    </div>
+                </div>
+            )}
+
             {/* Campaigns List */}
             {loading ? (
                 <div style={{ ...card(t), padding: '80px', textAlign: 'center', color: t.textMuted }}>Loading…</div>
@@ -194,17 +263,26 @@ export default function CampaignsPage() {
                 </div>
             ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                    {campaigns.filter(c => statusFilter === 'all' || c.status === statusFilter).length === 0 ? (
+                    {visibleCampaigns.length === 0 ? (
                         <div style={{ padding: '40px', textAlign: 'center', color: t.textMuted, fontSize: '14px' }}>
                             No {statusFilter !== 'all' ? statusFilter : ''} campaigns found.
                         </div>
                     ) : (
-                        campaigns.filter(c => statusFilter === 'all' || c.status === statusFilter).map((c) => {
+                        visibleCampaigns.map((c) => {
                             const or = openRate(c);
                             const br = bounceRate(c);
                         const pct = c.total_contacts > 0 ? Math.min((c.sent_count / c.total_contacts) * 100, 100) : 0;
                         return (
-                            <Link key={c.id} href={`/dashboard/campaigns/${c.id}`} style={{ textDecoration: 'none' }}>
+                            <div key={c.id} style={{ display: 'flex', alignItems: 'stretch', gap: '10px' }}>
+                                <label aria-label={`Select ${c.name}`} style={{ display: 'flex', alignItems: 'center', padding: '0 2px', cursor: 'pointer' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={selectedIds.includes(c.id)}
+                                        onChange={() => toggleCampaign(c.id)}
+                                        style={{ width: '17px', height: '17px', accentColor: t.accent, cursor: 'pointer' }}
+                                    />
+                                </label>
+                                <Link href={`/dashboard/campaigns/${c.id}`} style={{ textDecoration: 'none', flex: 1 }}>
                                 <div style={{ ...card(t), overflow: 'hidden', cursor: 'pointer' }}
                                     onMouseEnter={e => (e.currentTarget.style.background = t.cardHover)}
                                     onMouseLeave={e => (e.currentTarget.style.background = t.card)}
@@ -247,7 +325,8 @@ export default function CampaignsPage() {
                                         </div>
                                     </div>
                                 </div>
-                            </Link>
+                                </Link>
+                            </div>
                         );
                     })
                     )}

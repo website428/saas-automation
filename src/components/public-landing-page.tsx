@@ -57,7 +57,7 @@ function LeadForm({ content, onLead }: { content: Record<string, unknown>; onLea
     async function submit(event: FormEvent) {
         event.preventDefault(); setSaving(true); setMessage(""); onLead?.();
         const params = new URLSearchParams(window.location.search);
-        const response = await fetch("/api/leads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...form, page_slug: params.get("page") || window.location.pathname.replace(/^\/p\//, "") || "landing-page", utm_source: params.get("utm_source") || "", utm_medium: params.get("utm_medium") || "", utm_campaign: params.get("utm_campaign") || "" }) });
+        const response = await fetch("/api/leads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...form, page_slug: params.get("page") || window.location.pathname.replace(/^\/p\//, "") || "landing-page", page_variant: params.get("variant") || "", utm_source: params.get("utm_source") || "", utm_medium: params.get("utm_medium") || "", utm_campaign: params.get("utm_campaign") || "", utm_content: params.get("utm_content") || "" }) });
         const body = await response.json();
         setMessage(response.ok ? asText(content.success_message, "Thanks — we will be in touch shortly.") : body.error || "Please try again.");
         if (response.ok) trackMetaEvent("Lead");

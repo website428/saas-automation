@@ -8,6 +8,25 @@ import { supabase } from "@/lib/supabase";
 import { formatQueueTime } from "@/lib/data";
 import { ArrowLeft, Send, Clock, CheckCircle, AlertTriangle, RefreshCw, Trash2, Mail, Eye, MousePointerClick, XCircle } from "lucide-react";
 
+type DeliveryReport = {
+    recipients: number;
+    statuses: Record<string, number>;
+    initialStatuses: Record<string, number>;
+    accepted: number;
+    delivered: number;
+    opened: number;
+    replies: number;
+    issues: number;
+    initialProcessed: number;
+};
+
+type ReplyHealth = {
+    replyToEmail: string;
+    replyDomain: string;
+    status: 'ready' | 'missing_mx' | 'unavailable' | 'invalid';
+    message: string;
+};
+
 function toDateTimeLocalValue(date: Date): string {
     const pad = (value: number) => String(value).padStart(2, '0');
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
@@ -117,6 +136,8 @@ export default function CampaignDetailPage() {
     const [queue, setQueue] = useState<any[]>([]);
     const [previewQueueId, setPreviewQueueId] = useState('');
     const [recentOpens, setRecentOpens] = useState<any[]>([]);
+    const [deliveryReport, setDeliveryReport] = useState<DeliveryReport | null>(null);
+    const [replyHealth, setReplyHealth] = useState<ReplyHealth | null>(null);
     const [loading, setLoading] = useState(true);
     const [sending, setSending] = useState(false);
     const [autoSending, setAutoSending] = useState(false);
@@ -130,10 +151,12 @@ export default function CampaignDetailPage() {
     const autoSendRef = useRef(false);
 
     async function load() {
-        const [campRes, queueRes, opensRes] = await Promise.all([
+        const [campRes, queueRes, opensRes, reportRes, replyRes] = await Promise.all([
             supabase.from('campaigns').select('*, domains(domain_name, from_email, daily_limit, send_hour_start, send_hour_end)').eq('id', campaignId).single(),
             supabase.from('email_queue').select('*, contacts(name, email, company_name, job_title, website, personalization)').eq('campaign_id', campaignId).order('scheduled_at', { ascending: true }),
             supabase.from('email_opens').select('opened_at, contacts(name, email)').eq('campaign_id', campaignId).order('opened_at', { ascending: false }).limit(50),
+            fetch(`/api/campaigns/${campaignId}/delivery-report`, { cache: 'no-store' }).then(async response => response.ok ? response.json() : null).catch(() => null),
+            fetch(`/api/campaigns/${campaignId}/reply-health`, { cache: 'no-store' }).then(async response => response.ok ? response.json() : null).catch(() => null),
         ]);
         if (campRes.data) setCampaign(campRes.data);
         if (queueRes.data) {
@@ -143,6 +166,8 @@ export default function CampaignDetailPage() {
                 : queueRes.data?.find(item => item.sequence_step === 1)?.id || queueRes.data?.[0]?.id || '');
         }
         if (opensRes.data) setRecentOpens(opensRes.data);
+        if (reportRes) setDeliveryReport(reportRes);
+        if (replyRes) setReplyHealth(replyRes);
         setLoading(false);
     }
 
@@ -164,7 +189,7 @@ export default function CampaignDetailPage() {
     async function handleSend() {
         setSending(true);
         setAutoSending(true);
-        setSendProgress({ sent: 0, total: queued });
+        setSendProgress({ sent: 0, total: initialQueued });
         setSendNotice(null);
         autoSendRef.current = true;
         try {
@@ -196,7 +221,7 @@ export default function CampaignDetailPage() {
                 catch { result = { error: raw || `Server returned HTTP ${res.status}` }; }
                 if (!res.ok) throw new Error(result.error || `Force send failed with HTTP ${res.status}`);
                 totalSent += result.sent || 0;
-                setSendProgress({ sent: totalSent, total: queued });
+                setSendProgress({ sent: totalSent, total: initialQueued });
                 if (Array.isArray(result.errors)) providerErrors.push(...result.errors);
                 console.log(`Batch done: sent ${result.sent}, remaining: ${result.remaining}`);
                 await load();
@@ -277,12 +302,17 @@ export default function CampaignDetailPage() {
     async function handleDelete() {
         setDeleting(true);
         try {
-            // Campaigns have ON DELETE CASCADE for email_queue and send_logs
-            await supabase.from('campaigns').delete().eq('id', campaignId);
+            const response = await fetch('/api/campaigns/bulk-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: [campaignId] }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(payload.error || 'Could not delete campaign.');
             router.push('/dashboard/campaigns');
         } catch (e) {
             console.error('Delete error:', e);
-            alert('Failed to delete campaign. Please try again.');
+            alert(e instanceof Error ? e.message : 'Failed to delete campaign. Please try again.');
             setDeleting(false);
             setConfirmDelete(false);
         }
@@ -301,14 +331,19 @@ export default function CampaignDetailPage() {
         </div>
     );
 
-    const pct = campaign.total_contacts > 0 ? Math.min((campaign.sent_count / campaign.total_contacts) * 100, 100) : 0;
-    const openRate = campaign.sent_count > 0 ? ((campaign.opened_count / campaign.sent_count) * 100).toFixed(1) : null;
-    const bounceRate = campaign.sent_count > 0 ? ((campaign.bounced_count / campaign.sent_count) * 100).toFixed(1) : null;
-
-    const queued = queue.filter(q => q.status === 'queued').length;
-    const sent = queue.filter(q => q.status === 'sent').length;
-    const failed = queue.filter(q => q.status === 'failed').length;
     const initialQueue = queue.filter(item => item.sequence_step === 1);
+    const recipients = deliveryReport?.recipients ?? campaign.total_contacts ?? initialQueue.length;
+    const queued = deliveryReport?.statuses.queued ?? queue.filter(q => q.status === 'queued').length;
+    const initialQueued = deliveryReport?.initialStatuses.queued ?? initialQueue.filter(q => q.status === 'queued').length;
+    const delivered = deliveryReport?.delivered ?? queue.filter(q => ['delivered', 'opened', 'clicked', 'complained'].includes(q.status)).length;
+    const opened = deliveryReport?.opened ?? queue.filter(q => ['opened', 'clicked'].includes(q.status)).length;
+    const replied = deliveryReport?.replies ?? 0;
+    const bounced = deliveryReport?.statuses.bounced ?? queue.filter(q => q.status === 'bounced').length;
+    const initialProcessed = deliveryReport?.initialProcessed ?? Math.max(0, recipients - initialQueued);
+    const pct = recipients > 0 ? Math.min((initialProcessed / recipients) * 100, 100) : 0;
+    const openRate = delivered > 0 ? ((opened / delivered) * 100).toFixed(1) : null;
+    const bounceRate = deliveryReport?.accepted ? ((bounced / deliveryReport.accepted) * 100).toFixed(1) : null;
+    const replyReady = replyHealth?.status === 'ready';
     const personalizedInitialCount = initialQueue.filter(item => item.personalized_subject?.trim() && item.personalized_body?.trim()).length;
     const previewQueueItem = queue.find(item => item.id === previewQueueId) || initialQueue[0] || queue[0] || null;
     const previewStep = previewQueueItem?.sequence_step || 1;
@@ -349,10 +384,10 @@ export default function CampaignDetailPage() {
                             <RefreshCw style={{ width: '13px', height: '13px', animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
                             Refresh
                         </button>
-                        {(campaign.status === 'active' || campaign.status === 'draft') && queued > 0 && (
-                            <button onClick={handleSend} disabled={sending} title="Send queued emails now. Scheduled time and office-hour checks are bypassed, but safety quotas remain enforced." style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px', borderRadius: '10px', background: t.accent, color: '#fff', border: 'none', cursor: sending ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600, fontFamily: t.font }}>
+                        {(campaign.status === 'active' || campaign.status === 'draft') && initialQueued > 0 && (
+                            <button onClick={handleSend} disabled={sending || (!!replyHealth && !replyReady)} title="Send queued initial emails now. Scheduled time and office-hour checks are bypassed, but safety quotas remain enforced." style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px', borderRadius: '10px', background: t.accent, color: '#fff', border: 'none', cursor: sending || (!!replyHealth && !replyReady) ? 'not-allowed' : 'pointer', opacity: replyHealth && !replyReady ? 0.55 : 1, fontSize: '13px', fontWeight: 600, fontFamily: t.font }}>
                                 <Send style={{ width: '13px', height: '13px' }} />
-                                {sending ? 'Sending…' : `Force Send All (${queued})`}
+                                {sending ? 'Sending…' : replyHealth && !replyReady ? 'Fix Reply-To first' : `Force Send Initial (${initialQueued})`}
                             </button>
                         )}
                         {campaign.status === 'paused' && (
@@ -407,19 +442,30 @@ export default function CampaignDetailPage() {
                 </div>
             )}
 
+            {replyHealth && (
+                <div style={{ padding: '14px 16px', borderRadius: '10px', border: `1px solid ${replyReady ? t.green : t.coral}`, background: replyReady ? t.greenSoft : t.coralSoft, color: replyReady ? t.green : t.coral, fontSize: '13px', lineHeight: 1.55 }}>
+                    <strong>{replyReady ? '✓ Reply receiving is ready.' : '⚠ Sending blocked: replies are not configured.'}</strong>{' '}
+                    {replyHealth.message}
+                    {!replyReady && (
+                        <span> Add a working <code>REPLY_TO_EMAIL</code> in both Vercel and Supabase secrets, or enable Resend Receiving and add its MX record. Existing sent messages cannot be changed.</span>
+                    )}
+                </div>
+            )}
+
             {/* Stats row — responsive grid */}
-            <div className="camp-detail-stats" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '12px' }}>
+            <div className="camp-detail-stats" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '12px' }}>
                 {[
-                    { label: 'Total', value: campaign.total_contacts, color: t.text },
-                    { label: 'Sent', value: sent, color: t.green },
+                    { label: 'Recipients', value: recipients, color: t.text },
+                    { label: 'Delivered', value: delivered, color: t.green },
                     { label: 'Queued', value: queued, color: t.amber },
                     {
                         label: 'Opened',
-                        value: campaign.opened_count || 0,
+                        value: opened,
                         color: '#818cf8',
                         sub: openRate ? `${openRate}% rate` : null,
                     },
-                    { label: 'Failed', value: failed, color: failed > 0 ? t.coral : t.textMuted },
+                    { label: 'Replied', value: replied, color: replied > 0 ? t.green : t.textMuted },
+                    { label: 'Bounced', value: bounced, color: bounced > 0 ? t.coral : t.textMuted, sub: bounceRate ? `${bounceRate}% rate` : null },
                 ].map(s => (
                     <div key={s.label} style={card(t)}>
                         <p style={lbl(t)}>{s.label}</p>
@@ -432,7 +478,7 @@ export default function CampaignDetailPage() {
             </div>
 
             {/* Normal scheduled sending — does not bypass time windows or quotas */}
-            {queued > 0 && !['completed', 'aborted'].includes(campaign.status) && (
+            {initialQueued > 0 && !['completed', 'aborted'].includes(campaign.status) && (
                 <div style={card(t)}>
                     <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
                         <div style={{ flex: 1, minWidth: '240px' }}>
@@ -452,16 +498,16 @@ export default function CampaignDetailPage() {
                                     value={scheduleAt}
                                     min={toDateTimeLocalValue(new Date())}
                                     onChange={e => setScheduleAt(e.target.value)}
-                                    disabled={scheduling || sending || deleting}
+                                    disabled={scheduling || sending || deleting || (!!replyHealth && !replyReady)}
                                     style={{ padding: '9px 10px', borderRadius: '8px', border: `1px solid ${t.border}`, background: t.cardInner, color: t.text, fontFamily: t.font, fontSize: '12px' }}
                                 />
                             </label>
                             <button
                                 onClick={handleSchedule}
-                                disabled={scheduling || sending || deleting}
+                                disabled={scheduling || sending || deleting || (!!replyHealth && !replyReady)}
                                 style={{ padding: '10px 14px', borderRadius: '8px', border: 'none', background: t.green, color: '#fff', fontSize: '12px', fontWeight: 700, cursor: scheduling ? 'wait' : 'pointer', fontFamily: t.font }}
                             >
-                                {scheduling ? 'Saving…' : 'Schedule campaign'}
+                                {scheduling ? 'Saving…' : replyHealth && !replyReady ? 'Fix Reply-To first' : 'Schedule campaign'}
                             </button>
                         </div>
                     </div>
@@ -476,14 +522,14 @@ export default function CampaignDetailPage() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
                     <span style={{ ...lbl(t), display: 'flex', alignItems: 'center', gap: '8px' }}>
                         Send Progress
-                        {campaign.status === 'active' && queued > 0 && (
+                        {campaign.status === 'active' && initialQueued > 0 && (
                             <span style={{ color: t.accent, fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', textTransform: 'none', letterSpacing: 'normal' }}>
                                 <RefreshCw style={{ width: '10px', height: '10px', animation: 'spin 2s linear infinite' }} />
                                 {sending ? `Force sending ${sendProgress.sent}/${sendProgress.total}…` : 'Waiting for the scheduled worker…'}
                             </span>
                         )}
                     </span>
-                    <span style={{ fontSize: '13px', fontWeight: 600, color: t.text, fontFamily: 'monospace' }}>{sent}/{campaign.total_contacts} ({pct.toFixed(0)}%)</span>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: t.text, fontFamily: 'monospace' }}>{initialProcessed}/{recipients} ({pct.toFixed(0)}%)</span>
                 </div>
                 <div style={{ height: '8px', background: t.borderLight, borderRadius: '6px', overflow: 'hidden' }}>
                     <div style={{ height: '100%', width: `${pct}%`, background: campaign.status === 'completed' ? t.green : (autoSending ? t.accent : '#60a5fa'), borderRadius: '6px', transition: 'width 600ms ease' }} />
@@ -493,6 +539,9 @@ export default function CampaignDetailPage() {
                         ✓ Completed {new Date(campaign.completed_at).toLocaleString()}
                     </p>
                 )}
+                <p style={{ margin: '9px 0 0', fontSize: '11px', color: t.textMuted }}>
+                    Delivered means the recipient's mail server accepted the message; it does not guarantee Primary Inbox placement. Open tracking can be affected by mailbox privacy tools.
+                </p>
             </div>
 
             {/* Recent Opens Feed */}
@@ -539,7 +588,9 @@ export default function CampaignDetailPage() {
             <div style={card(t)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                     <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 600, color: t.text }}>Email Queue</h3>
-                    <span style={{ fontSize: '12px', color: t.textMuted }}>{initialQueue.length} recipients · {queue.length} scheduled messages</span>
+                    <span style={{ fontSize: '12px', color: t.textMuted }}>
+                        {recipients} recipients · showing {queue.length} of {Object.values(deliveryReport?.statuses || {}).reduce((sum, value) => sum + value, queue.length)} scheduled messages
+                    </span>
                 </div>
                 <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' as any }}>
                     <div style={{ minWidth: '600px' }}>
@@ -613,7 +664,7 @@ export default function CampaignDetailPage() {
 
             <style>{`
                 @keyframes spin { to { transform: rotate(360deg); } }
-                .camp-detail-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+                .camp-detail-stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
                 @media (max-width: 800px) {
                     .camp-detail-stats { grid-template-columns: repeat(3, 1fr) !important; }
                 }

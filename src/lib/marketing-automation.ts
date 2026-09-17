@@ -199,6 +199,7 @@ export async function processMarketingEvent(input: MarketingEventInput) {
             ...(input.razorpay_subscription_id ? { razorpay_subscription_id: input.razorpay_subscription_id } : {}),
             ...(input.razorpay_payment_id ? { razorpay_payment_id: input.razorpay_payment_id } : {}),
             ...(input.razorpay_order_id ? { razorpay_order_id: input.razorpay_order_id } : {}),
+            ...(input.event === "paid" && Number.isFinite(Number(input.metadata?.amount)) ? { last_payment_amount: Number(input.metadata?.amount) / 100, last_payment_currency: String(input.metadata?.currency || "INR") } : {}),
             ...(input.event === "trial_started" ? { trial_started_at: timestamp } : {}),
             ...(input.event === "paid" ? { paid_at: timestamp } : {}),
             ...(input.event === "churned" || input.event === "subscription_cancelled" ? { churned_at: timestamp } : {}),

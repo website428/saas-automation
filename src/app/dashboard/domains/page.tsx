@@ -23,6 +23,7 @@ type ReputationDomain = {
         records: Array<{ record?: string; type?: string; status?: string }>;
     };
     dmarc: { status: 'present' | 'missing' | 'unavailable'; policy: string | null; host: string };
+    mx: { status: 'present' | 'missing' | 'unavailable'; records: string[]; detail: string };
     blacklist: { status: 'listed' | 'not_listed' | 'unavailable'; detail: string };
     findings: string[];
 };
@@ -51,6 +52,8 @@ export default function DomainsPage() {
     const [reputation, setReputation] = useState<ReputationReport | null>(null);
     const [reputationLoading, setReputationLoading] = useState(false);
     const [reputationError, setReputationError] = useState('');
+    const [syncingResend, setSyncingResend] = useState(false);
+    const [syncMessage, setSyncMessage] = useState('');
 
     const REGIONS = [
         { id: "india", label: "India (9 AM - 6 PM)", start: 9, end: 18, flag: "🇮🇳" },
@@ -71,6 +74,24 @@ export default function DomainsPage() {
         setLoading(false);
     }
     useEffect(() => { load(); }, []);
+
+    async function syncResendDomains() {
+        setSyncingResend(true);
+        setSyncMessage('');
+        try {
+            const response = await fetch('/api/domains/sync-resend', { method: 'POST' });
+            const json = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(json.error || 'Could not sync Resend domains.');
+            setSyncMessage(json.synced
+                ? `Added ${json.synced} new Resend domain${json.synced === 1 ? '' : 's'} as paused.`
+                : 'All current Resend domains are already in the portal.');
+            await load();
+        } catch (error) {
+            setSyncMessage(error instanceof Error ? error.message : 'Could not sync Resend domains.');
+        } finally {
+            setSyncingResend(false);
+        }
+    }
 
     async function checkAllDomains() {
         setReputationLoading(true);
@@ -174,15 +195,30 @@ export default function DomainsPage() {
                     <h1 style={{ fontSize: '26px', fontWeight: 700, letterSpacing: '-0.03em', color: t.text, margin: 0 }}>Sending Domains</h1>
                     <p style={{ marginTop: '6px', fontSize: '14px', color: t.textMuted }}>Monitor provider verification, authentication, blacklist signals, and delivery health.</p>
                 </div>
-                <button
-                    onClick={checkAllDomains}
-                    disabled={reputationLoading}
-                    style={{ padding: '10px 16px', borderRadius: '9px', border: `1px solid ${t.accent}`, background: t.accentSoft, color: t.accent, fontSize: '13px', fontWeight: 700, cursor: reputationLoading ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: '7px', fontFamily: t.font }}
-                >
-                    <RefreshCw style={{ width: '14px', height: '14px' }} />
-                    {reputationLoading ? 'Checking…' : 'Check All Domains'}
-                </button>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                    <button
+                        onClick={syncResendDomains}
+                        disabled={syncingResend}
+                        style={{ padding: '10px 16px', borderRadius: '9px', border: `1px solid ${t.border}`, background: 'transparent', color: t.text, fontSize: '13px', fontWeight: 700, cursor: syncingResend ? 'wait' : 'pointer', fontFamily: t.font }}
+                    >
+                        {syncingResend ? 'Syncing…' : 'Sync Resend Domains'}
+                    </button>
+                    <button
+                        onClick={checkAllDomains}
+                        disabled={reputationLoading}
+                        style={{ padding: '10px 16px', borderRadius: '9px', border: `1px solid ${t.accent}`, background: t.accentSoft, color: t.accent, fontSize: '13px', fontWeight: 700, cursor: reputationLoading ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: '7px', fontFamily: t.font }}
+                    >
+                        <RefreshCw style={{ width: '14px', height: '14px' }} />
+                        {reputationLoading ? 'Checking…' : 'Check All Domains'}
+                    </button>
+                </div>
             </div>
+
+            {syncMessage && (
+                <div style={{ ...card(t), padding: '12px 16px', color: syncMessage.includes('Could not') ? t.coral : t.green }}>
+                    {syncMessage}
+                </div>
+            )}
 
             {reputationError && (
                 <div style={{ ...card(t), padding: '14px 18px', color: t.coral, background: t.coralSoft }}>
@@ -224,6 +260,7 @@ export default function DomainsPage() {
                                                 Resend: <strong>{result.resend?.status || 'missing'}</strong>
                                                 {' · '}DMARC: <strong>{result.dmarc.status === 'present' ? `p=${result.dmarc.policy}` : result.dmarc.status}</strong>
                                                 {' · '}Spamhaus: <strong>{result.blacklist.status.replace('_', ' ')}</strong>
+                                                {' · '}Reply MX: <strong>{result.mx.status}</strong>
                                                 {result.portal && ` · Bounce: ${result.portal.bounceRate}% · Complaints (30d): ${result.portal.complaints30d}`}
                                             </p>
                                         </div>

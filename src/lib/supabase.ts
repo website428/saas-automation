@@ -3,6 +3,18 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
+// This portal does not use Supabase Auth for dashboard access. The default
+// browser client still starts GoTrue and coordinates auth-token refreshes
+// across every open tab with Navigator LockManager. A stale tab can then hold
+// `lock:sb-<project>-auth-token` and make Excel campaign setup fail after 10s.
+// Keep the auth client in memory and run its tiny critical sections directly;
+// database queries and Edge Function calls continue to use the anon key.
+const noNavigatorLock = async <R>(
+  _name: string,
+  _acquireTimeout: number,
+  fn: () => Promise<R>,
+): Promise<R> => fn();
+
 const missingSupabaseConfig = () => {
   throw new Error(
     'Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in the deployment environment.',
@@ -13,7 +25,14 @@ const missingSupabaseConfig = () => {
 // still fails immediately and clearly if a request reaches the app without the
 // required runtime variables.
 export const supabase = supabaseUrl && supabaseAnonKey
-  ? createClient(supabaseUrl, supabaseAnonKey)
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+        lock: noNavigatorLock,
+      },
+    })
   : new Proxy({} as ReturnType<typeof createClient>, {
       get: missingSupabaseConfig,
     });

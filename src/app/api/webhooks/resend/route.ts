@@ -54,6 +54,14 @@ export async function POST(req: NextRequest) {
 
         switch (eventType) {
             case 'email.sent':
+                // Resend includes the RFC Message-ID in sent events. Keep it
+                // beside the API ID so inbound replies can be matched to the
+                // exact campaign email in Gmail and Outlook.
+                if (data?.message_id) {
+                    await supabase.from('email_queue').update({
+                        outbound_message_id: normalizeMessageId(data.message_id),
+                    }).eq('id', queueItem.id);
+                }
             case 'email.delivered':
                 // Only increment stats if it hasn't already been marked as sent/delivered
                 if (queueItem.status === 'queued') {
@@ -175,4 +183,10 @@ export async function POST(req: NextRequest) {
         console.error('Webhook error:', err);
         return NextResponse.json({ error: err.message }, { status: 500 });
     }
+}
+
+function normalizeMessageId(input: unknown): string | null {
+    const value = String(input || '').trim();
+    const match = value.match(/<[^<>]+>/);
+    return match ? match[0] : null;
 }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Resend } from 'resend';
 import { serverSupabase } from '@/lib/server-supabase';
+import { checkReplyHealth } from '@/lib/reply-health';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -136,6 +137,17 @@ export async function POST(req: NextRequest) {
         const domain = campaign.domains as any;
         if (!domain) return NextResponse.json({ error: 'Domain not found' }, { status: 404 });
 
+        // Never send a campaign whose Reply-To address cannot receive mail.
+        // This prevents successful outreach replies from disappearing silently.
+        const replyHealth = await checkReplyHealth(domain.domain_name);
+        if (replyHealth.status !== 'ready') {
+            return NextResponse.json({
+                error: `${replyHealth.message} Configure REPLY_TO_EMAIL to a working inbox or enable inbound MX for this sending domain before sending.`,
+                sent: 0,
+                replyHealth,
+            }, { status: replyHealth.status === 'unavailable' ? 503 : 409 });
+        }
+
         // Automated sends respect the configured IST window. A deliberate manual
         // force-send bypasses timing restrictions; quota limits remain hard.
         const s = domain.send_hour_start ?? 9;
@@ -188,7 +200,13 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ message: 'No emails ready to send right now', sent: 0 });
         }
 
-        const fromName = domain.sender_name || process.env.SENDER_NAME || 'Prince Gupta';
+        // Use a professional brand sender by default.  Older domain rows may
+        // still contain the previous personal name, so do not allow that
+        // value to leak into newly sent campaign emails.
+        const configuredSenderName = String(domain.sender_name || process.env.SENDER_NAME || '').trim();
+        const fromName = configuredSenderName && configuredSenderName.toLowerCase() !== 'prince gupta'
+            ? configuredSenderName
+            : 'FinaSoft Ventures LLP';
         // Base URL for unsubscribe links — set NEXT_PUBLIC_APP_URL in env for production
         const appBaseUrl = (process.env.NEXT_PUBLIC_APP_URL || req.nextUrl.origin).replace(/\/$/, '');
         let sent = 0;
@@ -318,15 +336,13 @@ export async function POST(req: NextRequest) {
 
             let quotaReserved = false;
             try {
-                // Reply-To: keep as the sending domain email so Resend inbound can intercept
-                // the reply and route it to the dashboard Inbox (chat section).
-                // If REPLY_TO_EMAIL is explicitly set in env, use that instead.
-                const replyToEmail = process.env.REPLY_TO_EMAIL || domain.from_email;
-
                 const emailPayload: any = {
                     from: `${fromName} <${domain.from_email}>`,
                     to: [contact.email],
-                    reply_to: replyToEmail,
+                    // The Node SDK uses camelCase. This becomes the RFC
+                    // Reply-To header that routes a recipient's reply to the
+                    // Resend receiving mailbox.
+                    replyTo: replyHealth.replyToEmail,
                     subject: finalSubject,
                     // List-Unsubscribe: required by Gmail bulk sender policy (Feb 2024) for >5k/day
                     // and strongly recommended for all bulk senders to avoid spam classification
@@ -335,6 +351,7 @@ export async function POST(req: NextRequest) {
                         'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
                     },
                     tags: [
+                        { name: 'queue_id', value: item.id },
                         { name: 'campaign_id', value: campaignId },
                         { name: 'contact_id', value: item.contact_id },
                     ],
@@ -397,11 +414,30 @@ export async function POST(req: NextRequest) {
                 // if a later database update fails.
                 quotaReserved = false;
 
+                // Resend's send response has its API delivery ID. Retrieve
+                // the sent message once to record its RFC Message-ID as well;
+                // Gmail and Outlook use that exact value in In-Reply-To.
+                let outboundMessageId: string | null = null;
+                if (resendData?.id) {
+                    try {
+                        const { data: sentEmail, error: sentEmailError } = await resend.emails.get(resendData.id);
+                        if (sentEmailError) {
+                            console.warn('[send-emails] Could not retrieve outbound Message-ID:', sentEmailError.message);
+                        } else {
+                            outboundMessageId = normalizeMessageId((sentEmail as any)?.message_id || '');
+                        }
+                    } catch (messageIdError) {
+                        console.warn('[send-emails] Outbound Message-ID lookup failed:', messageIdError);
+                    }
+                }
+
                 await serverSupabase.from('email_queue').update({
                     status: 'sent',
                     sent_at: new Date().toISOString(),
                     resend_id: resendData?.id,
+                    outbound_message_id: outboundMessageId,
                     attempts: item.attempts + 1,
+                    error_message: null,
                 }).eq('id', item.id);
 
                 // Atomic increments — no stale reads
@@ -452,4 +488,10 @@ export async function POST(req: NextRequest) {
     } catch (err: any) {
         return NextResponse.json({ error: err.message }, { status: 500 });
     }
+}
+
+function normalizeMessageId(input: unknown): string | null {
+    const value = String(input || '').trim();
+    const match = value.match(/<[^<>]+>/);
+    return match ? match[0] : null;
 }

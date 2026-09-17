@@ -64,6 +64,7 @@ export async function POST(request: Request) {
     }
 
     const pageSlug = clean(body.page_slug, 100).toLowerCase().replace(/[^a-z0-9-]/g, "");
+    const pageVariant = clean(body.page_variant, 40).toLowerCase().replace(/[^a-z0-9_-]/g, "");
     const companyName = clean(body.company_name, 160);
     const companyWebsite = clean(body.company_website, 300);
     const industry = clean(body.industry, 100).toLowerCase();
@@ -119,6 +120,7 @@ export async function POST(request: Request) {
       last_utm_source: clean(body.utm_source, 80) || null,
       last_utm_medium: clean(body.utm_medium, 80) || null,
       last_utm_campaign: clean(body.utm_campaign, 80) || null,
+      last_landing_variant: pageVariant || null,
       updated_at: new Date().toISOString(),
     };
 
@@ -210,6 +212,7 @@ export async function POST(request: Request) {
               utm_medium: clean(body.utm_medium, 80),
               utm_campaign: clean(body.utm_campaign, 80),
               utm_content: clean(body.utm_content, 80),
+              variant: pageVariant,
               requirement,
               budget_band: budgetBand,
               timeline,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { serverSupabase } from '@/lib/server-supabase';
 
 // This endpoint is designed to be triggered by an external cron service (like cron-job.org)
 // every 2-5 minutes. It runs in the background and processes all active campaigns safely.
@@ -8,10 +8,20 @@ export const maxDuration = 60; // 60 seconds max execution
 
 export async function GET(req: NextRequest) {
     try {
-        // Optional: If you want to secure this, you can require a specific header or query param.
-        // For Vercel Cron Jobs, they automatically send an Authorization header matching CRON_SECRET.
+        // Vercel Cron automatically uses the Bearer form.  External schedulers
+        // can use either that form, an X-Cron-Secret header, or HTTP Basic Auth
+        // with username `cron` and the CRON_SECRET as its password.
         const authHeader = req.headers.get('authorization');
-        if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        const expectedSecret = process.env.CRON_SECRET;
+        const expectedBasic = expectedSecret
+            ? `Basic ${Buffer.from(`cron:${expectedSecret}`).toString('base64')}`
+            : null;
+        const isAuthorized = !expectedSecret
+            || authHeader === `Bearer ${expectedSecret}`
+            || authHeader === expectedBasic
+            || req.headers.get('x-cron-secret') === expectedSecret;
+
+        if (!isAuthorized) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
@@ -19,7 +29,10 @@ export async function GET(req: NextRequest) {
         const origin = req.nextUrl.origin;
 
         // 1. Fetch all currently active campaigns
-        const { data: campaigns, error } = await supabase
+        // This is a server-only worker.  It must use the service-role client,
+        // not the browser/anonymous client, otherwise RLS can hide active
+        // campaigns from the scheduler in production.
+        const { data: campaigns, error } = await serverSupabase
             .from('campaigns')
             .select('id')
             .eq('status', 'active');

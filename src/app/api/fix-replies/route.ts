@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { Resend } from 'resend';
+import { serverSupabase as supabase } from '@/lib/server-supabase';
 
 /**
  * GET /api/fix-replies
@@ -17,11 +18,49 @@ import { supabase } from '@/lib/supabase';
 export async function GET(req: NextRequest) {
     const dryRun = req.nextUrl.searchParams.get('dry_run') === '1';
     const results: string[] = [];
-    const apiKey = process.env.RESEND_API_KEY;
+    const apiKey = process.env.RESEND_RECEIVING_API_KEY || process.env.RESEND_API_KEY;
 
-    if (!apiKey) {
-        return NextResponse.json({ error: 'RESEND_API_KEY not set' }, { status: 500 });
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+        return NextResponse.json({ error: 'SUPABASE_SERVICE_ROLE_KEY not set' }, { status: 500 });
     }
+    if (!apiKey) {
+        return NextResponse.json({ error: 'RESEND_RECEIVING_API_KEY or RESEND_API_KEY not set' }, { status: 500 });
+    }
+    const resend = new Resend(apiKey);
+
+    // Backfill the RFC Message-ID for already-sent campaigns. This makes the
+    // new reply matcher work for older campaign emails too, provided the
+    // recipient uses Reply on the original email.
+    let messageIdsBackfilled = 0;
+    const { data: queueWithoutMessageIds, error: queueError } = await supabase
+        .from('email_queue')
+        .select('id, resend_id')
+        .not('resend_id', 'is', null)
+        .is('outbound_message_id', null)
+        .order('sent_at', { ascending: false })
+        .limit(100);
+    if (queueError) {
+        return NextResponse.json({ error: queueError.message }, { status: 500 });
+    }
+    for (const item of queueWithoutMessageIds || []) {
+        try {
+            const { data: sentEmail, error: sentEmailError } = await resend.emails.get(item.resend_id);
+            const messageId = normalizeMessageId((sentEmail as any)?.message_id || '');
+            if (!sentEmailError && messageId) {
+                if (!dryRun) {
+                    const { error: updateError } = await supabase
+                        .from('email_queue')
+                        .update({ outbound_message_id: messageId })
+                        .eq('id', item.id);
+                    if (updateError) throw updateError;
+                }
+                messageIdsBackfilled++;
+            }
+        } catch (error) {
+            results.push(`Could not backfill Message-ID for queue ${item.id.substring(0, 8)}.`);
+        }
+    }
+    results.push(`${dryRun ? 'Found' : 'Backfilled'} ${messageIdsBackfilled} outbound Message-ID${messageIdsBackfilled === 1 ? '' : 's'}.`);
 
     // ── Step 1: Find all placeholder inbound messages ─────────────
     const { data: messages, error: msgErr } = await supabase
@@ -46,7 +85,7 @@ export async function GET(req: NextRequest) {
             .eq('direction', 'inbound')
             .limit(5);
         return NextResponse.json({
-            done: true, results,
+            done: true, message_ids_backfilled: messageIdsBackfilled, results,
             debug_inbound_sample: allInbound?.map(m => ({ id: m.id, body: m.body?.substring(0, 60) })),
         });
     }
@@ -58,22 +97,15 @@ export async function GET(req: NextRequest) {
     let page = 0;
 
     while (page < 5) { // max 5 pages = 500 emails
-        const url: string = cursor
-            ? `https://api.resend.com/emails/receiving?limit=100&after=${cursor}`
-            : `https://api.resend.com/emails/receiving?limit=100`;
-
-
-        const listRes = await fetch(url, {
-            headers: { Authorization: `Bearer ${apiKey}` },
+        const { data: listData, error: listError } = await resend.emails.receiving.list({
+            limit: 100,
+            ...(cursor ? { after: cursor } : {}),
         });
-
-        if (!listRes.ok) {
-            results.push(`Resend List API page ${page} returned ${listRes.status}`);
+        if (listError || !listData) {
+            results.push(`Resend Receiving API page ${page} failed: ${listError?.message || 'no data'}`);
             break;
         }
-
-        const listData = await listRes.json();
-        const pageEmails = listData?.data || listData?.emails || [];
+        const pageEmails = listData.data || [];
         allReceived = [...allReceived, ...pageEmails];
 
         if (!listData.has_more || pageEmails.length === 0) break;
@@ -129,18 +161,13 @@ export async function GET(req: NextRequest) {
         results.push(`  → Best match: ${emailId} (${diffMinutes}min apart)`);
 
         // Fetch body for this specific email
-        const fetchRes = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
-            headers: { Authorization: `Bearer ${apiKey}` },
-        });
-
-        if (!fetchRes.ok) {
-            results.push(`  → API ${fetchRes.status} for ${emailId}`);
+        const { data: receivedEmail, error: receivingError } = await resend.emails.receiving.get(emailId);
+        if (receivingError || !receivedEmail) {
+            results.push(`  → Receiving API failed for ${emailId}: ${receivingError?.message || 'no email returned'}`);
             continue;
         }
-
-        const d = await fetchRes.json();
-        let newBody = d.text || '';
-        if (!newBody && d.html) newBody = stripHtml(d.html);
+        let newBody = receivedEmail.text || '';
+        if (!newBody && receivedEmail.html) newBody = stripHtml(receivedEmail.html);
 
         // Strip quoted reply history
         if (newBody) {
@@ -181,12 +208,18 @@ export async function GET(req: NextRequest) {
         }
     }
 
-    return NextResponse.json({ done: true, fixed, total: messages.length, dry_run: dryRun, results });
+    return NextResponse.json({ done: true, fixed, total: messages.length, message_ids_backfilled: messageIdsBackfilled, dry_run: dryRun, results });
 }
 
 function extractEmailAddr(input: string): string {
     const match = input.match(/<(.+?)>/);
     return match ? match[1].trim() : input.trim();
+}
+
+function normalizeMessageId(input: unknown): string | null {
+    const value = String(input || '').trim();
+    const match = value.match(/<[^<>]+>/);
+    return match ? match[0] : null;
 }
 
 function stripHtml(html: string): string {

@@ -22,6 +22,7 @@ const workflowItems = [
 ];
 const resultsItems = [
     { label: "Analytics", href: "/dashboard/analytics", icon: BarChart3 },
+    { label: "Ads & Attribution", href: "/dashboard/ads", icon: Target },
     { label: "Replies", href: "/dashboard/inbox", icon: MessageSquare },
 ];
 const advancedItems = [

@@ -5,7 +5,7 @@ import { useTheme } from "@/components/theme-provider";
 import { supabase } from "@/lib/supabase";
 import {
     MessageSquare, Send, Sparkles, ArrowLeft, Loader2, Mail,
-    Circle, Clock, Building2,
+    Circle, Clock, Building2, RefreshCw,
 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -56,6 +56,13 @@ function getBrandColor(productName: string, fallback: string): string {
     return fallback;
 }
 
+// Paused domains are still configured reply domains and should remain visible.
+// Only burned domains are hidden from the default Inbox view; "All domains"
+// can be used when historical threads need to be audited.
+function isCurrentDomain(status: unknown): boolean {
+    return String(status || "").toLowerCase() !== "burned";
+}
+
 export default function InboxPage() {
     const { theme: t } = useTheme();
 
@@ -72,17 +79,37 @@ export default function InboxPage() {
     const [sending, setSending] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [mobileShowChat, setMobileShowChat] = useState(false);
+    const [replyError, setReplyError] = useState("");
+    const [repairing, setRepairing] = useState(false);
+    const [repairMessage, setRepairMessage] = useState("");
+    const [showHistory, setShowHistory] = useState(false);
+    const [currentResendDomains, setCurrentResendDomains] = useState<string[] | null>(null);
+    const [lastEventAt, setLastEventAt] = useState<Date | null>(null);
+    const [realtimeStatus, setRealtimeStatus] = useState<'connecting' | 'live' | 'offline'>('connecting');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     // ── Load domain tabs ─────────────────────────────────────────
     useEffect(() => {
         loadDomainTabs();
+    }, [showHistory]);
+
+    useEffect(() => {
+        void loadCurrentResendDomains();
     }, []);
+
+    useEffect(() => {
+        // Once Resend's live domain list arrives, replace the temporary
+        // database-only Inbox view with the current provider-backed view.
+        if (currentResendDomains !== null) {
+            loadDomainTabs();
+            loadThreads();
+        }
+    }, [currentResendDomains]);
 
     // ── Load threads when active domain changes ─────────────────
     useEffect(() => {
         loadThreads();
-    }, [activeDomainId]);
+    }, [activeDomainId, showHistory]);
 
     // ── Auto scroll ─────────────────────────────────────────────
     useEffect(() => {
@@ -95,6 +122,7 @@ export default function InboxPage() {
             .channel("inbox-messages-live")
             .on("postgres_changes", { event: "INSERT", schema: "public", table: "inbox_messages" }, (payload) => {
                 const msg = payload.new as Message;
+                setLastEventAt(new Date());
                 setSelectedThread((cur) => {
                     if (cur && msg.thread_id === cur.id && msg.direction === "inbound") {
                         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
@@ -102,7 +130,7 @@ export default function InboxPage() {
                     return cur;
                 });
             })
-            .subscribe();
+            .subscribe((status) => setRealtimeStatus(status === 'SUBSCRIBED' ? 'live' : status === 'CLOSED' || status === 'CHANNEL_ERROR' ? 'offline' : 'connecting'));
         return () => { supabase.removeChannel(ch); };
     }, []);
 
@@ -111,29 +139,57 @@ export default function InboxPage() {
         const ch = supabase
             .channel("inbox-threads-live")
             .on("postgres_changes", { event: "*", schema: "public", table: "inbox_threads" }, () => {
+                setLastEventAt(new Date());
                 loadDomainTabs();
                 loadThreads();
             })
             .subscribe();
         return () => { supabase.removeChannel(ch); };
+    }, [activeDomainId, showHistory]);
+
+    // Polling is a safety net for deployments where Supabase Realtime has not
+    // yet been enabled on inbox tables. Realtime remains the fast path.
+    useEffect(() => {
+        const interval = setInterval(() => {
+            loadDomainTabs();
+            loadThreads();
+        }, 30000);
+        return () => clearInterval(interval);
     }, [activeDomainId]);
 
     // ── Data loading ─────────────────────────────────────────────
+    async function loadCurrentResendDomains() {
+        try {
+            const response = await fetch('/api/domains/current-resend', { cache: 'no-store' });
+            const json = await response.json().catch(() => ({}));
+            if (!response.ok || !Array.isArray(json.domains)) return;
+            setCurrentResendDomains(json.domains.map((domain: string) => domain.toLowerCase()));
+        } catch {
+            // Keep the database view available if Resend is temporarily down.
+        }
+    }
+
+    function isLiveResendDomain(domainName: string | undefined) {
+        return currentResendDomains === null || currentResendDomains.includes(String(domainName || '').toLowerCase());
+    }
+
     async function loadDomainTabs() {
         setTabsLoading(true);
 
         // Get all domains that have at least one inbox thread
         const { data } = await supabase
             .from("inbox_threads")
-            .select("domain_id, is_read, domains(id, product_name, domain_name)");
+            .select("domain_id, is_read, domains(id, product_name, domain_name, status)");
 
         if (!data) { setTabsLoading(false); return; }
 
         // Group by domain
         const map = new Map<string, DomainTab>();
         for (const row of data) {
-            const d = row.domains as any;
+            const d = (Array.isArray(row.domains) ? row.domains[0] : row.domains) as any;
             if (!d) continue;
+            if (!showHistory && !isCurrentDomain(d.status)) continue;
+            if (!showHistory && !isLiveResendDomain(d.domain_name)) continue;
             const existing = map.get(d.id);
             if (existing) {
                 existing.thread_count++;
@@ -158,7 +214,7 @@ export default function InboxPage() {
 
         let query = supabase
             .from("inbox_threads")
-            .select("*, contacts(name, email), domains(id, product_name, domain_name)")
+            .select("*, contacts(name, email), domains(id, product_name, domain_name, status)")
             .order("last_at", { ascending: false });
 
         if (activeDomainId) {
@@ -168,7 +224,12 @@ export default function InboxPage() {
         const { data } = await query;
 
         setThreads(
-            (data || []).map((row: any) => ({
+            (data || []).filter((row: any) => {
+                const domain = Array.isArray(row.domains) ? row.domains[0] : row.domains;
+                return showHistory || (isCurrentDomain(domain?.status) && isLiveResendDomain(domain?.domain_name));
+            }).map((row: any) => {
+                const domain = Array.isArray(row.domains) ? row.domains[0] : row.domains;
+                return ({
                 id: row.id,
                 subject: row.subject,
                 last_message: row.last_message,
@@ -178,11 +239,34 @@ export default function InboxPage() {
                 contact_name: row.contacts?.name || "",
                 contact_email: row.contacts?.email || "",
                 domain_id: row.domain_id,
-                domain_name: row.domains?.domain_name || "",
-                product_name: row.domains?.product_name || row.domains?.domain_name || "",
-            }))
+                domain_name: domain?.domain_name || "",
+                product_name: domain?.product_name || domain?.domain_name || "",
+            });
+            })
         );
         setThreadsLoading(false);
+    }
+
+    async function repairMissingReplies() {
+        if (repairing) return;
+        setRepairing(true);
+        setRepairMessage("");
+        try {
+            const res = await fetch("/api/fix-replies");
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(payload.error || `Repair failed (HTTP ${res.status})`);
+            const fixed = Number(payload.fixed || 0);
+            const messageIdsBackfilled = Number(payload.message_ids_backfilled || 0);
+            setRepairMessage(fixed > 0 || messageIdsBackfilled > 0
+                ? `Repaired ${fixed} repl${fixed === 1 ? "y" : "ies"}${messageIdsBackfilled > 0 ? ` and linked ${messageIdsBackfilled} sent message${messageIdsBackfilled === 1 ? "" : "s"}` : ""}.`
+                : "No missing reply bodies were found. Check the Receiving API key and webhook history.");
+            await Promise.all([loadDomainTabs(), loadThreads()]);
+            if (selectedThread) await selectThread(selectedThread);
+        } catch (error) {
+            setReplyError(error instanceof Error ? error.message : "Could not repair missing replies.");
+        } finally {
+            setRepairing(false);
+        }
     }
 
     async function selectThread(thread: Thread) {
@@ -209,21 +293,19 @@ export default function InboxPage() {
     async function handleSendReply() {
         if (!replyText.trim() || !selectedThread || sending) return;
         setSending(true);
+        setReplyError("");
 
-        const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-        const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+        try {
+            const res = await fetch('/api/inbox/send-reply', {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ threadId: selectedThread.id, replyText }),
+            });
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(payload.error || `Reply failed (HTTP ${res.status})`);
 
-        const res = await fetch(`${supabaseUrl}/functions/v1/send-reply`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${anonKey}`,
-                "apikey": anonKey,
-            },
-            body: JSON.stringify({ threadId: selectedThread.id, replyText }),
-        });
-
-        if (res.ok) {
             setMessages((prev) => [...prev, {
                 id: crypto.randomUUID(),
                 thread_id: selectedThread.id,
@@ -233,8 +315,11 @@ export default function InboxPage() {
             }]);
             setReplyText("");
             loadThreads();
+        } catch (error) {
+            setReplyError(error instanceof Error ? error.message : "Reply could not be sent.");
+        } finally {
+            setSending(false);
         }
-        setSending(false);
     }
 
     async function handleAiReply() {
@@ -257,6 +342,10 @@ export default function InboxPage() {
         if (res.ok) {
             const d = await res.json();
             setReplyText(d.reply || "");
+            setReplyError("");
+        } else {
+            const d = await res.json().catch(() => ({}));
+            setReplyError(d.error || `AI draft failed (HTTP ${res.status})`);
         }
         setGenerating(false);
     }
@@ -291,13 +380,47 @@ export default function InboxPage() {
                         {totalUnread} new
                     </span>
                 )}
+                <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "6px", color: realtimeStatus === 'live' ? t.green : realtimeStatus === 'offline' ? t.coral : t.amber, fontSize: "11px", fontWeight: 600 }} title={lastEventAt ? `Last event ${lastEventAt.toLocaleTimeString()}` : "Waiting for an inbox event"}>
+                    <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: "currentColor" }} />
+                    {realtimeStatus === 'live' ? 'Live' : realtimeStatus === 'offline' ? 'Polling' : 'Connecting'}
+                    {lastEventAt ? ` · ${lastEventAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
+                </span>
+                <button onClick={() => { loadDomainTabs(); loadThreads(); }} title="Refresh conversations" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "7px", borderRadius: "8px", border: `1px solid ${t.border}`, background: "transparent", color: t.textMuted, cursor: "pointer" }}>
+                    <RefreshCw style={{ width: "14px", height: "14px" }} />
+                </button>
+                <button
+                    onClick={() => setShowHistory((value) => !value)}
+                    title={showHistory ? "Hide paused and legacy domains" : "Include paused and legacy domains"}
+                    style={{ padding: "7px 10px", borderRadius: "8px", border: `1px solid ${showHistory ? t.accent : t.border}`, background: showHistory ? t.accentSoft : "transparent", color: showHistory ? t.accent : t.textMuted, cursor: "pointer", fontSize: "11px", fontWeight: 600, whiteSpace: "nowrap" }}
+                >
+                    {showHistory ? "All domains" : "Current domains"}
+                </button>
+                <button
+                    onClick={repairMissingReplies}
+                    disabled={repairing}
+                    title="Fetch full text for inbound messages that were saved as placeholders"
+                    style={{ padding: "7px 10px", borderRadius: "8px", border: `1px solid ${t.border}`, background: "transparent", color: t.textMuted, cursor: repairing ? "wait" : "pointer", fontSize: "11px", fontWeight: 600, whiteSpace: "nowrap" }}
+                >
+                    {repairing ? "Repairing…" : "Repair replies"}
+                </button>
             </div>
+
+            {replyError && (
+                <div style={{ marginBottom: "12px", padding: "11px 13px", borderRadius: "9px", border: `1px solid ${t.coral}66`, background: t.coralSoft, color: t.coral, fontSize: "12px", lineHeight: 1.5 }}>
+                    {replyError}
+                </div>
+            )}
+            {repairMessage && (
+                <div style={{ marginBottom: "12px", padding: "9px 13px", borderRadius: "9px", border: `1px solid ${t.green}55`, background: `${t.green}12`, color: t.green, fontSize: "12px" }}>
+                    {repairMessage}
+                </div>
+            )}
 
             {/* Brand Tabs — horizontal scroll on mobile */}
             <div style={{ display: "flex", gap: "6px", marginBottom: "16px", overflowX: "auto", flexShrink: 0, paddingBottom: "4px", WebkitOverflowScrolling: "touch" as any }}>
                 {/* All tab */}
                 <button
-                    onClick={() => { setActiveDomainId(null); setSelectedThread(null); }}
+                    onClick={() => { setActiveDomainId(null); setSelectedThread(null); setMobileShowChat(false); }}
                     style={{
                         padding: "6px 14px",
                         borderRadius: "99px",
@@ -328,7 +451,7 @@ export default function InboxPage() {
                     return (
                         <button
                             key={domain.id}
-                            onClick={() => { setActiveDomainId(domain.id); setSelectedThread(null); }}
+                            onClick={() => { setActiveDomainId(domain.id); setSelectedThread(null); setMobileShowChat(false); }}
                             style={{
                                 padding: "6px 14px",
                                 borderRadius: "99px",
@@ -367,7 +490,7 @@ export default function InboxPage() {
             </div>
 
             {/* Main Panel — fills remaining height */}
-            <div className="inbox-panel" style={{
+            <div className={`inbox-panel${mobileShowChat ? " mobile-chat-open" : ""}`} style={{
                 background: t.card,
                 border: `1px solid ${t.border}`,
                 borderRadius: "14px",

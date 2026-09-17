@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
-import { Webhook } from 'standardwebhooks';
+import { serverSupabase as supabase } from '@/lib/server-supabase';
+import { Resend } from 'resend';
 
 /**
  * POST /api/webhooks/inbound
@@ -14,20 +14,100 @@ import { Webhook } from 'standardwebhooks';
  */
 export async function POST(req: NextRequest) {
     try {
-        const webhookSecret = process.env.RESEND_WEBHOOK_SECRET;
-        if (!webhookSecret) return NextResponse.json({ error: 'Webhook secret not configured' }, { status: 500 });
+        if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+            return NextResponse.json({ error: 'SUPABASE_SERVICE_ROLE_KEY is not configured' }, { status: 500 });
+        }
+        // A Resend signing secret belongs to one webhook endpoint.  Keep the
+        // inbound secret separate from the delivery-events secret, but accept
+        // either during a safe migration from older deployments.
+        const webhookSecrets = [
+            process.env.RESEND_INBOUND_WEBHOOK_SECRET?.trim(),
+            process.env.RESEND_WEBHOOK_SECRET?.trim(),
+        ].filter((secret): secret is string => Boolean(secret));
+        if (!webhookSecrets.length) {
+            return NextResponse.json({ error: 'Webhook secret not configured' }, { status: 500 });
+        }
         const rawBody = await req.text();
-        const headers: Record<string, string> = {};
-        req.headers.forEach((value, key) => { headers[key] = value; });
+        const id = req.headers.get('svix-id');
+        const timestamp = req.headers.get('svix-timestamp');
+        const signature = req.headers.get('svix-signature');
+        if (!id || !timestamp || !signature) {
+            console.warn('[inbound] Missing Resend Svix signature headers');
+            return NextResponse.json({ error: 'Missing Resend signature headers' }, { status: 400 });
+        }
+
+        // This is Resend's official SDK verification API. It verifies the
+        // exact, unmodified body Resend signed plus the three Svix headers.
+        const resend = new Resend(process.env.RESEND_RECEIVING_API_KEY || process.env.RESEND_API_KEY);
         let outer: any;
-        try {
-            outer = new Webhook(webhookSecret).verify(rawBody, headers);
-        } catch {
+        for (const webhookSecret of webhookSecrets) {
+            try {
+                outer = resend.webhooks.verify({
+                    payload: rawBody,
+                    headers: { id, timestamp, signature },
+                    webhookSecret,
+                });
+                break;
+            } catch {
+                // Try the legacy delivery-webhook secret once before rejecting.
+            }
+        }
+        if (!outer) {
+            console.warn('[inbound] Invalid Resend signature', {
+                hasInboundSecret: Boolean(process.env.RESEND_INBOUND_WEBHOOK_SECRET?.trim()),
+                hasDeliverySecret: Boolean(process.env.RESEND_WEBHOOK_SECRET?.trim()),
+                candidateCount: webhookSecrets.length,
+                hasSvixHeaders: Boolean(id && timestamp && signature),
+            });
             return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
         }
-        await supabase.rpc('record_resend_inbound_usage');
         // Resend wraps inbound payloads in { type, data } — unwrap if needed
         const data = outer?.data ?? outer;
+
+        // Capture the RFC Message-ID on the provider's email.sent event. This
+        // is more reliable than an immediate API lookup after a send, and it
+        // is the exact ID Gmail/Outlook put in In-Reply-To when replying.
+        if (outer?.type === 'email.sent') {
+            const sentResendId = data?.email_id || data?.id || '';
+            const outboundMessageId = normalizeMessageId(data?.message_id || '');
+            if (sentResendId && outboundMessageId) {
+                const { data: updatedRows, error } = await supabase
+                    .from('email_queue')
+                    .update({ outbound_message_id: outboundMessageId })
+                    .eq('resend_id', sentResendId)
+                    .select('id');
+                if (error) throw new Error(`Could not store outbound Message-ID: ${error.message}`);
+                // The email.sent webhook can arrive before the sending worker
+                // finishes writing resend_id. Return a retryable response so
+                // Resend tries again instead of permanently losing the link.
+                if (!updatedRows?.length) {
+                    return NextResponse.json({ error: 'Queue row not ready; retry email.sent' }, { status: 503 });
+                }
+                console.log(`[inbound] Stored outbound Message-ID for ${sentResendId}`);
+            }
+            return NextResponse.json({ received: true, stored: Boolean(sentResendId && outboundMessageId), event: 'email.sent' });
+        }
+
+        // This endpoint is intentionally shared by email.received and
+        // email.sent. Acknowledge other event types without treating them as
+        // inbound replies.
+        if (outer?.type && outer.type !== 'email.received') {
+            return NextResponse.json({ received: true, ignored: outer.type });
+        }
+
+        await supabase.rpc('record_resend_inbound_usage');
+
+        // Optional clean-start guard. Old Resend retries are acknowledged but
+        // not added back after an Inbox reset.
+        const resetAt = process.env.INBOX_RESET_AT;
+        const eventCreatedAt = outer?.created_at || data?.created_at;
+        if (resetAt && eventCreatedAt) {
+            const resetTime = Date.parse(resetAt);
+            const eventTime = Date.parse(eventCreatedAt);
+            if (Number.isFinite(resetTime) && Number.isFinite(eventTime) && eventTime < resetTime) {
+                return NextResponse.json({ received: true, ignored: 'before inbox reset' });
+            }
+        }
 
         // ── Debug: log full payload so we can see exactly what Resend sends ──
         console.log('[inbound] Raw payload:', JSON.stringify(outer, null, 2));
@@ -41,6 +121,7 @@ export async function POST(req: NextRequest) {
 
         // Resend inbound uses email_id or id for the received message ID
         const emailId: string = data.email_id || data.id || '';
+        const inboundMessageId = normalizeMessageId(data.message_id || '');
 
         // ── In-Reply-To — Resend sends via Amazon SES, so the Message-ID format is:
         //   <0106019de6e-{RESEND_UUID}-000000@region.amazonses.com>
@@ -53,7 +134,10 @@ export async function POST(req: NextRequest) {
             data.inReplyTo ||
             '';
 
-        // Extract UUID from SES message-ID: match pattern xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        // Keep the full RFC Message-ID for precise modern matching. Retain the
+        // UUID extraction only as a fallback for campaign emails sent before
+        // outbound Message-IDs were stored.
+        let inReplyToMessageId = normalizeMessageId(inReplyToRaw);
         let inReplyTo: string | null = null;
         if (inReplyToRaw) {
             const uuidMatch = inReplyToRaw.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -78,31 +162,31 @@ export async function POST(req: NextRequest) {
             body = stripHtml(data.html);
         }
 
-        // Resend webhook payload NEVER includes the email body.
-        // We MUST call the Receiving API to get it.
-        // Correct endpoint: GET /emails/receiving/{email_id}
+        // Resend webhook payloads intentionally contain metadata only. Fetch
+        // the full received email immediately with the official Receiving API.
+        // This is what supplies the Gmail/Outlook reply body for Inbox.
         if (emailId) {
             try {
-                const r = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
-                    headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-                });
-                const rawText = await r.text();
-                console.log(`[inbound] GET /emails/receiving/${emailId} → ${r.status}: ${rawText.substring(0, 300)}`);
-                if (r.ok) {
-                    const d = JSON.parse(rawText);
-                    if (d.text) body = d.text;
-                    else if (d.html) body = stripHtml(d.html);
-
-                    // Also grab In-Reply-To from API response headers — extract UUID from SES format
-                    const apiHeaders: Record<string, string> = d.headers || {};
-                    const irtFromApi = apiHeaders['in-reply-to'] || apiHeaders['In-Reply-To'] || '';
-                    if (!inReplyTo && irtFromApi) {
-                        const uuidMatch = irtFromApi.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                        inReplyTo = uuidMatch ? uuidMatch[0] : null;
-                        console.log(`[inbound] In-Reply-To UUID from API: ${inReplyTo}`);
-                    }
+                const { data: receivedEmail, error: receivingError } = await resend.emails.receiving.get(emailId);
+                if (receivingError || !receivedEmail) {
+                    console.warn('[inbound] Receiving API could not retrieve message body', {
+                        emailId,
+                        error: receivingError?.message || 'No email returned',
+                    });
                 } else {
-                    console.warn(`[inbound] Receiving API returned ${r.status}: ${rawText.substring(0, 200)}`);
+                    if (receivedEmail.text) body = receivedEmail.text;
+                    else if (receivedEmail.html) body = stripHtml(receivedEmail.html);
+
+                    // The complete email includes the reply headers, unlike the
+                    // webhook metadata. They let us match the right campaign.
+                    const apiHeaders: Record<string, string> = receivedEmail.headers || {};
+                    const irtFromApi = apiHeaders['in-reply-to'] || apiHeaders['In-Reply-To'] || '';
+                    if (irtFromApi) inReplyToMessageId = inReplyToMessageId || normalizeMessageId(irtFromApi);
+                    if (!inReplyTo && irtFromApi) {
+                        const uuidMatch = irtFromApi.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+                        inReplyTo = uuidMatch ? uuidMatch[0] : null;
+                        console.log(`[inbound] In-Reply-To UUID from Receiving API: ${inReplyTo}`);
+                    }
                 }
             } catch (e) {
                 console.warn('[inbound] Receiving API fetch error:', e);
@@ -132,137 +216,80 @@ export async function POST(req: NextRequest) {
         // Use a descriptive fallback only if we truly got nothing
         if (!body) body = '(reply received — content unavailable)';
 
-        // ── Find contact ──────────────────────────────────────────────
-        const { data: contacts } = await supabase
-            .from('contacts')
-            .select('id')
-            .eq('email', fromEmail)
-            .limit(1);
-        const contact = contacts?.[0] ?? null;
-
-        // ── Find matching email_queue item (3-tier fallback) ──────────
+        // ── Find the precise outbound email that this message replies to ─
+        // Never attach a direct email merely because the sender happens to be
+        // a contact from an old campaign. That caused replies sent to one
+        // receiving address to appear under a different sending domain.
         let queueItem: any = null;
 
-        // Tier 1: Match by In-Reply-To (most precise — Resend stores UUID as resend_id)
+        // Match the full RFC Message-ID first. Gmail and Outlook put this in
+        // their In-Reply-To header when the recipient replies to a campaign.
+        if (inReplyToMessageId) {
+            const { data: q } = await supabase
+                .from('email_queue')
+                .select('id, campaign_id, contact_id, domain_id')
+                .eq('outbound_message_id', inReplyToMessageId)
+                .maybeSingle();
+            queueItem = q;
+            if (queueItem) console.log('[inbound] Matched by outbound RFC Message-ID');
+        }
+
+        // A reply to a message that was sent from the portal is part of an
+        // existing Inbox conversation, not a fresh campaign message. Resolve
+        // the stored portal outbound Message-ID back to its original thread.
+        if (!queueItem && inReplyToMessageId) {
+            const { data: portalMessage } = await supabase
+                .from('inbox_messages')
+                .select('thread_id')
+                .eq('direction', 'outbound')
+                .eq('resend_id', inReplyToMessageId)
+                .maybeSingle();
+            if (portalMessage?.thread_id) {
+                const { data: portalThread } = await supabase
+                    .from('inbox_threads')
+                    .select('queue_id, campaign_id, contact_id, domain_id')
+                    .eq('id', portalMessage.thread_id)
+                    .maybeSingle();
+                if (portalThread) {
+                    queueItem = {
+                        id: portalThread.queue_id,
+                        campaign_id: portalThread.campaign_id,
+                        contact_id: portalThread.contact_id,
+                        domain_id: portalThread.domain_id,
+                    };
+                    console.log('[inbound] Matched reply to an existing Inbox conversation');
+                }
+            }
+        }
+
+        // Legacy fallback for past queue records that stored only Resend's
+        // API UUID rather than the RFC Message-ID.
         if (inReplyTo) {
             const { data: q } = await supabase
                 .from('email_queue')
                 .select('id, campaign_id, contact_id, domain_id')
                 .eq('resend_id', inReplyTo)
                 .maybeSingle();
-            queueItem = q;
+            queueItem = queueItem || q;
             if (queueItem) console.log('[inbound] Matched by In-Reply-To');
         }
 
-        // Tier 2: Match by contact_id (most recent sent/delivered/opened email)
-        if (!queueItem && contact) {
-            const { data: q } = await supabase
-                .from('email_queue')
-                .select('id, campaign_id, contact_id, domain_id')
-                .eq('contact_id', contact.id)
-                .in('status', ['sent', 'delivered', 'opened', 'clicked'])
-                .order('sent_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-            queueItem = q;
-            if (queueItem) console.log('[inbound] Matched by contact_id');
-        }
-
-        // Tier 3: Join through contacts table by email address
+        // ── No queue match — acknowledge but do not pollute the reply Inbox ──
         if (!queueItem) {
-            const { data: q } = await supabase
-                .from('email_queue')
-                .select('id, campaign_id, contact_id, domain_id, contacts!inner(email)')
-                .eq('contacts.email', fromEmail)
-                .in('status', ['sent', 'delivered', 'opened', 'clicked'])
-                .order('sent_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-            queueItem = q;
-            if (queueItem) console.log('[inbound] Matched by email join');
-        }
-
-        // ── No queue match — still save to inbox using a fallback domain ──
-        if (!queueItem) {
-            console.warn('[inbound] No queue item matched for:', fromEmail, '— saving as unmatched reply');
-
-            // Try to find ANY domain to attach this to (use the "to" address domain)
-            const toDomain = toEmail.split('@')[1] || '';
-            const { data: domain } = await supabase
-                .from('domains')
-                .select('id')
-                .ilike('domain_name', `%${toDomain}%`)
-                .limit(1)
-                .maybeSingle();
-
-            if (!domain) {
-                // Can't save without a domain_id (FK constraint)
-                return NextResponse.json({ received: true, matched: false, reason: 'No domain found' });
-            }
-
-            // Upsert a contact if not known
-            let contactId: string | null = contact?.id || null;
-            if (!contactId) {
-                const { data: newContact } = await supabase
-                    .from('contacts')
-                    .insert({ email: fromEmail, name: fromEmail.split('@')[0], status: 'pending' })
-                    .select('id')
-                    .single();
-                contactId = newContact?.id || null;
-            }
-
-            if (!contactId) {
-                return NextResponse.json({ received: true, matched: false, reason: 'Could not create contact' });
-            }
-
-            // Find or create thread
-            const { data: existingUnmatched } = await supabase
-                .from('inbox_threads')
-                .select('id, message_count')
-                .eq('contact_id', contactId)
-                .eq('domain_id', domain.id)
-                .maybeSingle();
-
-            let unmatchedThreadId: string;
-            if (existingUnmatched) {
-                await supabase.from('inbox_threads').update({
-                    last_message: body.substring(0, 200),
-                    last_at: new Date().toISOString(),
-                    is_read: false,
-                    message_count: existingUnmatched.message_count + 1,
-                }).eq('id', existingUnmatched.id);
-                unmatchedThreadId = existingUnmatched.id;
-            } else {
-                const { data: newThread, error: tErr } = await supabase
-                    .from('inbox_threads')
-                    .insert({
-                        contact_id: contactId,
-                        domain_id: domain.id,
-                        campaign_id: null,
-                        queue_id: null,
-                        subject,
-                        last_message: body.substring(0, 200),
-                        last_at: new Date().toISOString(),
-                        is_read: false,
-                        message_count: 1,
-                    })
-                    .select('id')
-                    .single();
-                if (tErr || !newThread) {
-                    return NextResponse.json({ received: true, matched: false, reason: 'Thread insert failed' });
-                }
-                unmatchedThreadId = newThread.id;
-            }
-
-            await supabase.from('inbox_messages').insert({
-                thread_id: unmatchedThreadId,
-                direction: 'inbound',
-                body,
+            console.warn('[inbound] No In-Reply-To match for:', fromEmail, '— ignored');
+            return NextResponse.json({
+                received: true,
+                matched: false,
+                stored: false,
+                reason: inReplyToMessageId
+                    ? 'the original campaign Message-ID has not been stored yet; run Repair replies or send a new campaign after enabling email.sent'
+                    : 'this message has no In-Reply-To header; use Reply on the original campaign email instead of composing a new email',
             });
-
-            console.log(`[inbound] Unmatched reply saved: thread=${unmatchedThreadId} from=${fromEmail}`);
-            return NextResponse.json({ received: true, matched: false, threadId: unmatchedThreadId });
         }
+
+        // Optional Outlook copy. Set INBOX_FORWARD_TO_EMAIL in Vercel; only
+        // matched campaign replies are forwarded, never unrelated inbound mail.
+        await forwardMatchedReply({ resend, fromEmail, toEmail, subject, body });
 
         // ── Find or create inbox thread (matched path) ────────────────
         const { data: existing } = await supabase
@@ -275,12 +302,13 @@ export async function POST(req: NextRequest) {
         let threadId: string;
 
         if (existing) {
-            await supabase.from('inbox_threads').update({
+            const { error: updateThreadError } = await supabase.from('inbox_threads').update({
                 last_message: body.substring(0, 200),
                 last_at: new Date().toISOString(),
                 is_read: false,
                 message_count: existing.message_count + 1,
             }).eq('id', existing.id);
+            if (updateThreadError) throw new Error(`Thread update failed: ${updateThreadError.message}`);
             threadId = existing.id;
         } else {
             // Get original campaign content for the thread
@@ -335,11 +363,13 @@ export async function POST(req: NextRequest) {
 
         // ── Insert the inbound reply ──────────────────────────────────
         // Supabase Realtime pushes this to the Inbox page instantly
-        await supabase.from('inbox_messages').insert({
+        const { error: messageError } = await supabase.from('inbox_messages').insert({
             thread_id: threadId,
             direction: 'inbound',
             body,
+            resend_id: inboundMessageId || null,
         });
+        if (messageError) throw new Error(`Reply insert failed: ${messageError.message}`);
 
         // A real reply is the strongest stop signal. Cancel all remaining
         // automated follow-ups for this contact on this sending domain.
@@ -386,4 +416,47 @@ function extractEmail(input: any): string {
         return input.address || input.email || '';
     }
     return '';
+}
+
+function normalizeMessageId(input: unknown): string {
+    const value = String(input || '').trim();
+    if (!value) return '';
+    const bracketed = value.match(/<[^<>]+>/);
+    return bracketed ? bracketed[0] : value;
+}
+
+async function forwardMatchedReply({
+    resend,
+    fromEmail,
+    toEmail,
+    subject,
+    body,
+}: {
+    resend: Resend;
+    fromEmail: string;
+    toEmail: string;
+    subject: string;
+    body: string;
+}) {
+    const forwardTo = process.env.INBOX_FORWARD_TO_EMAIL?.trim();
+    if (!forwardTo) return;
+
+    const forwardFrom = (
+        process.env.INBOX_FORWARD_FROM_EMAIL ||
+        process.env.INBOX_REPLY_FROM_EMAIL ||
+        process.env.REPLY_TO_EMAIL ||
+        toEmail
+    ).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forwardFrom)) {
+        console.warn('[inbound] Outlook forwarding skipped: configure a verified sender address');
+        return;
+    }
+
+    const { error } = await resend.emails.send({
+        from: `Campaign Reply <${forwardFrom}>`,
+        to: [forwardTo],
+        subject: `[Campaign reply] ${subject}`,
+        text: `From: ${fromEmail}\nReceived at: ${toEmail}\n\n${body}`,
+    });
+    if (error) console.warn('[inbound] Outlook forwarding failed:', error.message);
 }
