@@ -95,6 +95,28 @@ Omit `campaign_id` when the event should update the CRM only. This is useful for
 - Use the content queue and weekly checklist to keep the non-email acquisition work moving.
 - Export the current lead view as CSV for a handoff or a backup.
 
+## Growth integrations added in migration 028
+
+Run `supabase/migrations/028_sales_integrations_and_attribution.sql` after migration 027. It adds Calendly booking identifiers/times, payment attribution fields, and indexes used by Ads & Attribution.
+
+### Calendly
+
+Set `CALENDLY_WEBHOOK_SIGNING_KEY` in Vercel and configure a Calendly webhook for:
+
+```text
+https://YOUR_DOMAIN/api/webhooks/calendly
+```
+
+Subscribe to `invitee.created` and `invitee.canceled`. A created meeting marks the contact as `audit_booked`, stores a confirmed booking, cancels queued nurture messages, creates a meeting-preparation task, and processes the `demo_booked` automation event. A cancellation is recorded in the sales activity timeline.
+
+### Meta Ads attribution
+
+Set `META_AD_ACCOUNT_ID` and `META_ADS_ACCESS_TOKEN` in Vercel. Open **Ads & Attribution** in the dashboard and enter the same admin secret used by Growth. The report reads Meta campaign spend/traffic and joins it with contacts captured through Meta campaign IDs or matching website UTM campaign names.
+
+### Optional GA4
+
+Set `NEXT_PUBLIC_GA_MEASUREMENT_ID` in Vercel to load GA4 on the application and public landing pages. Leave it empty to keep GA4 disabled.
+
 The checklist, content queue, and outreach templates are stored in the current browser's local storage. They are intentionally local until a shared team workspace or database-backed content library is added.
 
 External ad, LinkedIn, and social publishing actions still require the relevant platform credentials and APIs. The control center provides the planning, segmentation, and handoff layer without pretending those external APIs are connected.
@@ -105,3 +127,38 @@ External ad, LinkedIn, and social publishing actions still require the relevant 
 - Use a separate webhook secret per environment and rotate it if it is exposed.
 - Confirm the sending domain, reply-to address, unsubscribe handling, and Resend limits.
 - Start with a small active campaign and verify delivery, opens, replies, and queue deduplication before scaling.
+
+## Landing page builder
+
+The root URL is now the platform dashboard. Campaign pages are created from **Marketing → Landing Pages** and published as:
+
+```text
+https://YOUR_DOMAIN/p/your-slug
+```
+
+### Supabase setup
+
+1. Open Supabase and select the project used by this Vercel deployment.
+2. Open **SQL Editor → New query**.
+3. Run the existing migrations in order if this is a new database: `000_master_reset.sql` through `018_razorpay_billing.sql`.
+4. Run `019_landing_page_builder.sql` from this repository.
+5. Confirm that these tables exist under **Table Editor**:
+   - `landing_pages`
+   - `landing_page_sections`
+   - `landing_page_submissions`
+6. In Supabase **Settings → API**, copy the project URL, anon key, and service-role key into Vercel as `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY`.
+7. Add `MARKETING_WEBHOOK_SECRET` to Vercel. You may also add `LANDING_PAGE_ADMIN_SECRET` if you want a separate builder secret.
+8. Redeploy Vercel after saving the variables.
+
+### Creating a page
+
+1. Open `/dashboard/marketing?tab=landing-pages`.
+2. Enter the builder secret and select **Load pages**.
+3. Select **New**.
+4. Set the internal name, public slug, SEO title, and SEO description.
+5. Edit the section content. Simple fields are editable directly; `items` fields use JSON arrays for features, FAQs, and logos.
+6. Select **Save draft** while working.
+7. Select **Publish** when ready.
+8. Test the result at `/p/your-slug`.
+
+Every submitted form is sent to `/api/leads`, added to the existing `contacts` table, tagged with the page slug and UTM values, and recorded in `landing_page_submissions`. Set `PUBLIC_LEAD_AUTOMATION_ENABLED=true` only after the `lead_created` automation rule has an active campaign.
